@@ -990,4 +990,691 @@ class PreRoutingHookResponse(BaseModel):
 
 ---
 
+## 7. 深入分析补充
+
+### 7.1 后备链全部耗尽时的终止行为
+
+#### 7.1.1 终止决策流程
+
+当策略选出的模型及所有后备模型均失败后，路由器通过多层决策机制终止请求并上抛异常：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    后备链耗尽终止流程                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  请求入口: async_function_with_fallbacks()                          │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 1. 执行 async_function_with_retries()                         │ │
+│  │    - 重试策略指定的次数                                         │ │
+│  │    - 失败 → 跳转到后备处理                                     │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  async_function_with_fallbacks_common_utils()                       │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 2. 检查终止条件                                           │ │
+│  │    - disable_fallbacks is True → 直接抛出 original_exception  │ │
+│  │    - original_model_group is None → 直接抛出               │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 3. 查找后备模型组                                           │ │
+│  │    - get_fallback_model_group(fallbacks, model_group)        │ │
+│  │    - 无后备 → 在 original_exception.message 追加调试信息    │ │
+│  │    - 无后备 → 抛出 original_exception                       │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  run_async_fallback()                                                │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 4. 遍历后备模型组                                           │ │
+│  │    ┌────────────────────────────────────────────────────┐  │ │
+│  │    │ for mg in fallback_model_group:                     │  │ │
+│  │    │   try:                                               │  │ │
+│  │    │     ① log_retry() - 记录重试日志                  │  │ │
+│  │    │     ② 调用 async_function_with_fallbacks()         │  │ │
+│  │    │        - 递归进入新模型组                              │  │ │
+│  │    │        - 检查 fallback_depth >= max_fallbacks       │  │ │
+│  │    │          → 抛出 original_exception (深度超限终止)     │  │ │
+│  │    │     ③ 成功 → 返回响应 + log_success_fallback_event() │  │ │
+│  │    │   except Exception as e:                             │  │ │
+│  │    │     error_from_fallbacks = e                         │  │ │
+│  │    │     log_failure_fallback_event() - 通知策略层     │  │ │
+│  │    └────────────────────────────────────────────────────┘  │ │
+│  │                                                              │ │
+│  │ 5. 全部耗尽 → 抛出 error_from_fallbacks                     │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.1.2 关键终止代码
+
+**1. 深度超限终止** (`run_async_fallback` 中的基例：
+
+```python
+async def run_async_fallback(
+    ...,
+    max_fallbacks: int,
+    fallback_depth: int,
+    **kwargs,
+) -> Any:
+    ### BASE CASE ### MAX FALLBACK DEPTH REACHED
+    if fallback_depth >= max_fallbacks:
+        raise original_exception  # 直接抛出原始异常，不包装
+    
+    error_from_fallbacks = original_exception
+    
+    for mg in fallback_model_group:
+        if mg == original_model_group:
+            continue
+        try:
+            # ... 重试计数 +1
+            fallback_depth = fallback_depth + 1
+            kwargs["fallback_depth"] = fallback_depth
+            kwargs["max_fallbacks"] = max_fallbacks
+            # 递归调用
+            response = await litellm_router.async_function_with_fallbacks(
+                *args, **kwargs
+            )
+            return response
+        except Exception as e:
+            error_from_fallbacks = e  # 保存最后一个异常
+    
+    raise error_from_fallbacks  # 全部耗尽，抛出最后一个
+```
+
+**文件位置**: `litellm/router_utils/fallback_event_handlers.py:116-161
+
+**2. 无后备时的终止** (`async_function_with_fallbacks_common_utils`):
+
+```python
+async def async_function_with_fallbacks_common_utils(
+    self,
+    e: Exception,
+    disable_fallbacks: Optional[bool],
+    ...
+):
+    if disable_fallbacks is True or original_model_group is None:
+        raise e  # 直接上抛原始异常
+    
+    # ... 查找后备模型组
+    
+    if fallback_model_group is None:
+        verbose_router_logger.info(
+            f"No fallback model group found for original model_group={model_group}"
+        )
+        # 在异常消息中追加调试信息
+        if hasattr(original_exception, "message"):
+            original_exception.message += (
+                f"No fallback model group found for original model_group={model_group}. "
+                f"Fallbacks={fallbacks}"
+            )
+        raise original_exception  # 上抛原始异常
+```
+
+**文件位置**: `litellm/router.py:5354-5549
+
+#### 7.1.3 异常信息增强
+
+当后备链耗尽时，路由器会在原始异常中追加丰富的调试信息：
+
+```python
+if hasattr(original_exception, "message"):
+    # 追加已尝试的模型组信息
+    original_exception.message += (
+        ". Received Model Group={}\n"
+        "Available Model Group Fallbacks={}".format(
+            model_group,
+            fallback_model_group,
+        )
+    )
+    # 追加后备失败的具体错误
+    if len(fallback_failure_exception_str) > 0:
+        original_exception.message += (
+            "\nError doing the fallback: {}".format(
+                fallback_failure_exception_str
+            )
+        )
+
+raise original_exception
+```
+
+**文件位置**: `litellm/router.py:5578-5591
+
+#### 7.1.4 策略层与执行层的信号传递
+
+| 信号类型 | 传递方式 | 调用时机 | 策略层响应 |
+|---------|---------|---------|-----------|
+| **重试开始 | `log_retry(kwargs, e)` | 每次后备尝试前 | 记录重试日志 |
+| **后备成功** | `log_success_fallback_event()` | 后备成功后 | 策略可记录成功模型 |
+| **后备失败** | `log_failure_fallback_event()` | 单个后备失败后 | 策略可记录失败模型 |
+| **异常上抛** | `raise original_exception` | 全部耗尽后 | 调用方捕获处理 |
+
+**信号传递代码**：
+
+```python
+# 重试前日志
+kwargs = litellm_router.log_retry(kwargs=kwargs, e=original_exception)
+
+# 后备成功回调
+await log_success_fallback_event(
+    original_model_group=original_model_group,
+    kwargs=kwargs,
+    original_exception=original_exception,
+)
+
+# 后备失败回调
+await log_failure_fallback_event(
+    original_model_group=original_model_group,
+    kwargs=kwargs,
+    original_exception=original_exception,
+)
+```
+
+**文件位置**: `litellm/router_utils/fallback_event_handlers.py:127-160
+
+---
+
+### 7.2 自适应路由冷启动的先验初始化
+
+#### 7.2.1 先验配置体系
+
+自适应路由器的冷启动先验基于三层质量层级 + 能力标签系统：
+
+```python
+# 从 config.py 中定义的核心配置常量
+
+# D4 — Cold-start prior 配置
+BASE_TIER_WEIGHT: Dict[int, float] = {1: 0.3, 2: 0.5, 3: 0.7}
+#   Tier 1: 最低质量预期成功率 30% (经济型模型)
+#   Tier 2: 中等质量预期成功率 50% (标准型模型)
+#   Tier 3: 最高质量预期成功率 70% (旗舰型模型)
+
+STRENGTH_BONUS: float = 0.3
+#   如果模型声明擅长某类任务类型，+0.3 预期成功率加成
+
+COLD_START_MASS: float = 10.0
+#   总伪样本数 = 10
+#   意味着约 10 个真实样本才能显著移动后验
+```
+
+**文件位置**: `litellm/router_strategy/adaptive_router/config.py:16-20
+
+#### 7.2.2 初始参数计算逻辑
+
+`initial_cell` 函数根据模型的质量层级和能力标签计算 Beta 分布的初始 alpha/beta：
+
+```python
+def initial_cell(
+    prefs: AdaptiveRouterPreferences, 
+    request_type: RequestType
+) -> BanditCell:
+    """
+    (model, request_type) 单元格的冷启动先验
+    
+    计算公式:
+    1. base_mean = BASE_TIER_WEIGHT[quality_tier]
+    2. bonus = STRENGTH_BONUS if request_type in strengths else 0.0
+    3. mean = min(0.95, base_mean + bonus)  # 上限 0.95 防止过度自信
+    4. alpha = mean * COLD_START_MASS
+    5. beta = (1.0 - mean) * COLD_START_MASS
+    
+    示例:
+    - Tier 3 模型, 无能力标签:
+      mean = 0.7, alpha=7.0, beta=3.0
+      
+    - Tier 3 模型, 擅长 code_generation:
+      mean = min(0.95, 0.7 + 0.3) = 0.95
+      alpha=9.5, beta=0.5
+    """
+    # 验证质量层级
+    if prefs.quality_tier not in BASE_TIER_WEIGHT:
+        valid = sorted(BASE_TIER_WEIGHT)
+        raise ValueError(
+            f"quality_tier={prefs.quality_tier} is not supported; "
+            f"valid tiers are {valid}"
+        )
+    
+    base = BASE_TIER_WEIGHT[prefs.quality_tier]
+    bonus = STRENGTH_BONUS if request_type in prefs.strengths else 0.0
+    mean = min(0.95, base + bonus)
+    
+    alpha = mean * COLD_START_MASS
+    beta = (1.0 - mean) * COLD_START_MASS
+    
+    return BanditCell(alpha=alpha, beta=beta)
+```
+
+**文件位置**: `litellm/router_strategy/adaptive_router/bandit.py:45-66
+
+#### 7.2.3 质量层级与能力标签配置
+
+`AdaptiveRouterPreferences` 定义了模型的先验配置：
+
+```python
+# 从 types/router.py 推断的配置结构
+
+class AdaptiveRouterPreferences(BaseModel):
+    """单个模型的先验偏好配置"""
+    quality_tier: int  # 1, 2, 3 - 基础质量层级
+    strengths: List[RequestType]  # 模型擅长的请求类型列表
+    model_cost: float  # $/1k tokens，用于多目标评分
+
+# 请求类型枚举
+class RequestType(str, enum.Enum):
+    """固定的 v0 分类体系"""
+    CODE_GENERATION = "code_generation"
+    CODE_UNDERSTANDING = "code_understanding"
+    TECHNICAL_DESIGN = "technical_design"
+    ANALYTICAL_REASONING = "analytical_reasoning"
+    WRITING = "writing"
+    FACTUAL_LOOKUP = "factual_lookup"
+    GENERAL = "general"
+```
+
+**文件位置**: `litellm/types/router.py:805-815
+
+#### 7.2.4 先验对早期路由决策的影响机制
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              冷启动先验 → 后验更新 → 决策影响              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  阶段 1: 冷启动 (0 真实样本)                                     │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ BanditCell(alpha=7.0, beta=3.0)  (Tier 3, 无 strength) │ │
+│  │                                                              │ │
+│  │ mean = 7.0 / (7.0 + 3.0) = 0.7                            │ │
+│  │ total_samples = 7.0 + 3.0 - 10.0 = 0 (真实样本数)        │ │
+│  │                                                              │ │
+│  │ Thompson 采样: Beta(7, 3)                                   │ │
+│  │   - 95% 置信区间: ~(0.35, 0.93)                        │ │
+│  │   - 高不确定性，但整体偏向高质量预期                             │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  阶段 2: 早期学习 (N < 10 真实样本)                             │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 假设收到 3 个成功, 1 个失败:                                │ │
+│  │   new_alpha = 7.0 + 3.0 = 10.0                              │ │
+│  │   new_beta  = 3.0 + 1.0 = 4.0                               │ │
+│  │                                                              │ │
+│  │ mean = 10.0 / 14.0 ≈ 0.71 (仅移动 0.01)                  │ │
+│  │ total_samples = 14.0 - 10.0 = 4                           │ │
+│  │                                                              │ │
+│  │ 后验仍被先验主导，真实样本影响较小                           │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  阶段 3: 后期学习 (N >= 10 真实样本)                            │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 假设收到 15 个成功, 5 个失败:                             │ │
+│  │   new_alpha = 7.0 + 15.0 = 22.0                         │ │
+│  │   new_beta  = 3.0 + 5.0 = 8.0                           │ │
+│  │                                                              │ │
+│  │ mean = 22.0 / 30.0 ≈ 0.73                                │ │
+│  │ total_samples = 30.0 - 10.0 = 20                          │ │
+│  │                                                              │ │
+│  │ 先验质量 10 个样本 vs 真实 20 个样本                     │ │
+│  │ 后验开始由真实数据主导                                     │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.5 样本上限机制
+
+```python
+SAMPLE_CAP: int = 200  # 硬上限
+
+def apply_delta(cell: BanditCell, delta_alpha: float, delta_beta: float) -> BanditCell:
+    """
+    应用学习更新，强制执行样本上限
+    
+    SAMPLE_CAP 是 (alpha + beta) 的硬上限。
+    当超过上限时，直接丢弃更新。
+    
+    设计选择 (D5): 硬上限，不重新缩放 —— 保持 v0 简单
+    """
+    new_alpha = cell.alpha + delta_alpha
+    new_beta = cell.beta + delta_beta
+    
+    if new_alpha + new_beta > SAMPLE_CAP:
+        return cell  # 超过上限，不更新
+    
+    return BanditCell(alpha=new_alpha, beta=new_beta)
+```
+
+**文件位置**: `litellm/router_strategy/adaptive_router/bandit.py:69-80
+
+#### 7.2.6 先验设计的权衡
+
+| 设计决策 | 好处 | 代价 |
+|---------|------|------|
+| **COLD_START_MASS = 10** | 防止早期噪声样本过度影响；给真实样本需要积累再学习 | 新模型收敛较慢；需要更多真实样本才能显著调整 |
+| **质量层级系统 | 利用领域知识编码；高置信度初始预期 | 层级映射可能不准确；需要手动配置 |
+| **能力标签加成** | 利用模型已知优势；针对性优化路由 | 标签可能过时；需要持续验证 |
+| **硬上限 SAMPLE_CAP=200** | 防止过拟合；模型退化时更容易切换 | 长期学习被截断；无法持续优化 |
+
+---
+
+### 7.3 多实例 Redis 同步的竞争处理
+
+#### 7.3.1 双缓存架构与同步机制
+
+`BaseRoutingStrategy` 实现了内存 + Redis 双层缓存同步机制：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    双缓存同步架构 (usage-based-routing-v2)                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  读路径 (低延迟优先)                                               │
+│  ┌──────────────┐                                                 │
+│  │  请求到达   │                                                 │
+│  └──────┬───────┘                                                 │
+│         │                                                          │
+│         ▼                                                          │
+│  ┌───────────────────────────────┐                                   │
+│  │ 1. 本地内存缓存检查         │                                   │
+│  │    async_get_cache(key, local_only=True)                       │
+│  │    - 微秒级读取                                            │
+│  │    - 如果本地已超限 → 直接抛 RateLimitError                  │
+│  └───────────────┬───────────────┘                                   │
+│                  │                                                  │
+│                  ▼ 本地检查通过                                        │
+│  ┌───────────────────────────────┐                                   │
+│  │ 2. Redis 原子增量 + 检查    │                                   │
+│  │    _increment_value_in_current_window()                       │
+│  │    - Redis INCR 是原子操作                                    │
+│  │    - 返回 Redis 超限 → 抛 RateLimitError                         │
+│  └───────────────┬───────────────┘                                   │
+│                  │                                                  │
+│                  ▼ 检查通过                                            │
+│  ┌───────────────────────────────┐                                   │
+│  │ 3. 执行请求                  │                                   │
+│  └───────────────┬───────────────┘                                   │
+│                  │                                                  │
+│                  ▼ 请求成功                                            │
+│  ┌───────────────────────────────┐                                   │
+│  │ 4. 更新本地缓存 + 入队操作    │                                   │
+│  │    - router_cache.increment_cache()                               │
+│  │    - redis_increment_operation_queue.append(op)                       │
+│  └───────────────┬───────────────┘                                   │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  同步路径 (后台定期)                                                │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ periodic_sync_in_memory_spend_with_redis()                │ │
+│  │ - 每 0.1 秒执行一次                                       │ │
+│  │                                                              │ │
+│  │ 步骤 1: _push_in_memory_increments_to_redis()            │ │
+│  │   - 压缩同键多次增量为单次操作                            │ │
+│  │   - Redis Pipeline 批量执行                                 │ │
+│  │                                                              │ │
+│  │ 步骤 2: 拉取 Redis 最新值                                │ │
+│  │   - 合并 Redis 作为真值                                        │ │
+│  │   - 合并公式: merged = redis_val + (本地增量)                 │ │
+│  │   - 更新本地缓存                                                │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.2 增量操作压缩机制
+
+```python
+async def _push_in_memory_increments_to_redis(self):
+    """
+    同键增量压缩机制：
+    
+    场景:
+    - 请求 A 增加 100 tokens
+    - 请求 B 增加 50 tokens
+    - 请求 C 增加 30 tokens
+    
+    队列: [{"key": "k1", "val": 100}, {"key": "k1", "val": 50}, {"key": "k1", "val": 30}]
+    
+    压缩后:
+    - {"key": "k1", "val": 180} (单次 Redis 操作)
+    """
+    if len(self.redis_increment_operation_queue) > 0:
+        # 压缩同键操作
+        compressed_ops: Dict[str, RedisPipelineIncrementOperation] = {}
+        
+        for op in self.redis_increment_operation_queue:
+            if op["key"] in compressed_ops:
+                # 累加同键的值
+                compressed_ops[op["key"]]["increment_value"] += op["increment_value"]
+            else:
+                compressed_ops[op["key"]] = op
+        
+        # 转换回列表
+        compressed_queue = list(compressed_ops.values())
+        
+        # Redis Pipeline 批量执行
+        increment_result = (
+            await self.dual_cache.redis_cache.async_increment_pipeline(
+                increment_list=compressed_queue,
+            )
+        )
+```
+
+**文件位置**: `litellm/router_strategy/base_routing_strategy.py:116-173
+
+#### 7.3.3 预调用检查的双层保护
+
+`LowestTPMLoggingHandler_v2` 实现了双层速率限制检查：
+
+```python
+async def async_pre_call_check(
+    self, deployment: Dict, parent_otel_span: Optional[Span]
+) -> Optional[Dict]:
+    """
+    预调用检查 + 更新 RPM 计数
+    
+    检查顺序:
+    1. 本地内存缓存检查 (快速路径)
+    2. Redis 原子增量 + 检查 (一致性路径)
+    
+    设计意图:
+    - 本地检查防止绝大多数超限请求，避免不必要的 Redis round-trip
+    - Redis 检查确保多实例间的一致性
+    """
+    dt = get_utc_datetime()
+    current_minute = dt.strftime("%H-%M")
+    model_id = deployment.get("model_info", {}).get("id")
+    deployment_name = deployment.get("litellm_params", {}).get("model")
+    
+    rpm_key = f"{model_id}:{deployment_name}:rpm:{current_minute}"
+    
+    # ========== 第一层: 本地内存缓存检查 ==========
+    local_result = await self.router_cache.async_get_cache(
+        key=rpm_key, local_only=True
+    )
+    
+    if local_result is not None and local_result >= deployment_rpm:
+        # 本地已超限，快速失败
+        raise litellm.RateLimitError(
+            message="Deployment over defined rpm limit={}. current usage={}".format(
+                deployment_rpm, local_result
+            ),
+            ...
+        )
+    
+    # ========== 第二层: Redis 原子增量 + 检查 ==========
+    else:
+        # 本地检查通过，执行 Redis 原子增量
+        result = await self._increment_value_in_current_window(
+            key=rpm_key, value=1, ttl=self.routing_args.ttl
+        )
+        
+        if result is not None and result > deployment_rpm:
+            # Redis 返回值超限
+            raise litellm.RateLimitError(
+                message="Deployment over defined rpm limit={}. current usage={}".format(
+                    deployment_rpm, result
+                ),
+                ...
+            )
+    
+    return deployment
+```
+
+**文件位置**: `litellm/router_strategy/lowest_tpm_rpm_v2.py:141-225
+
+#### 7.3.4 竞争处理与一致性保证
+
+| 竞争场景 | 处理机制 | 一致性保证 |
+|---------|---------|-----------|
+| **同实例并发增量 | Redis INCR 原子操作 | 强一致 |
+| **跨实例并发增量 | Redis INCR + 定期同步 | 最终一致 |
+| **同键多增量** | 操作队列压缩 | 最终一致 |
+| **Redis 不可用** | 降级到仅内存缓存 | 仅本实例一致 |
+
+**关键一致性代码 (Redis 原子性依赖):
+
+```python
+# _sync_in_memory_spend_with_redis 中的合并逻辑
+
+for key in cache_keys_list:
+    redis_val = float(redis_values.get(key, 0) or 0)
+    before = float(in_memory_before_dict.get(key, 0) or 0)
+    after = float(
+        await self.dual_cache.in_memory_cache.async_get_cache(key=key) or 0
+    )
+    
+    delta = after - before  # 本实例自上次同步以来的增量
+    
+    if after <= redis_val:
+        # 本实例本地值 <= Redis 值: 正常情况
+        # 合并 = Redis 真值 + 本实例增量
+        merged = redis_val + delta
+        await self.dual_cache.in_memory_cache.async_set_cache(
+            key=key, value=merged
+        )
+    else:
+        # 本实例本地值 > Redis 值: 理论上不应该发生
+        # 代码中注释掉的 debug 断言:
+        # elif "rpm" in key:
+        #     print(f"Redis_val={redis_val} is behind in-memory cache_val={after}")
+        #     import os
+        #     os._exit(1)
+        #     raise Exception(...)
+        continue  # 实际处理: 跳过，不更新本地
+```
+
+**文件位置**: `litellm/router_strategy/base_routing_strategy.py:236-256
+
+#### 7.3.5 超速率限制的窗口期风险
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    窗口期风险分析                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  时间线 (假设同步间隔 0.1 秒 = 100ms)                      │
+│                                                                     │
+│  T=0ms:                                                         │
+│    - 实例 A: 本地 RPM=50, Redis RPM=50                         │
+│    - 实例 B: 本地 RPM=50, Redis RPM=50                         │
+│    - 限制定额: RPM=100                                            │
+│                                                                     │
+│  T=10ms:                                                          │
+│    - 实例 A: 收到 30 个请求 → 本地 RPM=80                      │
+│    - 实例 B: 收到 30 个请求 → 本地 RPM=80                      │
+│    - 两者本地检查均通过 (80 < 100)                                │
+│    - 两者 Redis INCR 均执行                                        │
+│                                                                     │
+│  T=20ms:                                                          │
+│    - Redis RPM = 50 + 30 + 30 = 110 (超限!)                  │
+│    - 但两个实例的本地缓存仍为 80                                    │
+│                                                                     │
+│  T=50ms:                                                         │
+│    - 实例 A: 再收到 15 个请求                                   │
+│    - 本地检查: 80 + 15 = 95 < 100 → 通过                    │
+│    - Redis INCR 返回 125 > 100 → 抛 RateLimitError           │
+│    - 但已经执行了 Redis 检查，防止超限                         │
+│                                                                     │
+│  T=100ms:                                                         │
+│    - 定期同步任务执行                                               │
+│    - 实例 A 拉取 Redis=125                                      │
+│    - 本地更新为 125                                                 │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  风险分析:                                                          │
+│                                                                     │
+│  风险点 1: 本地缓存落后 Redis (理论存在但实际有保护)                │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 本地缓存可能在同步间隔内落后于 Redis 的实际值               │ │
+│  │ 但 async_pre_call_check 有双重保护:                        │ │
+│  │   1. 本地检查 (快速)                                       │ │
+│  │   2. Redis INCR + 检查 (一致性)                            │ │
+│  │                                                               │ │
+│  │ 真正的风险场景:                                              │ │
+│  │ - 如果只有本地检查，没有 Redis 检查                          │ │
+│  │ - 但代码中两层都有                                          │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  风险点 2: 同步间隔内的超限                                     │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ TPM 计数在请求成功后才更新                                    │ │
+│  │ 存在窗口: 请求发出 → 成功返回 → 计数更新                   │ │
+│  │                                                               │ │
+│  │ 但 RPM 计数在 pre_call_check 时就通过 Redis INCR 原子更新   │ │
+│  │ 所以 RPM 有强一致性保护                                      │ │
+│  │ TPM 有最终一致性，但可能有短暂窗口                           │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.6 风险缓解措施
+
+| 风险类型 | 缓解措施 | 代码位置 |
+|---------|---------|---------|
+| **RPM 超限** | 双层检查 + Redis INCR 原子操作 | `lowest_tpm_rpm_v2.py:141-225` |
+| **TPM 窗口** | 定期同步 + 增量合并 | `base_routing_strategy.py:195-261` |
+| **Redis 不可用** | 降级到内存缓存，不失败请求 | `lowest_tpm_rpm_v2.py:222-225` |
+| **高并发竞争** | Redis 单线程模型 + INCR 原子性 | Redis 原生保证 |
+
+**降级处理代码**:
+
+```python
+async def async_pre_call_check(
+    self, deployment: Dict, parent_otel_span: Optional[Span]
+) -> Optional[Dict]:
+    try:
+        # ... 正常检查逻辑
+    except Exception as e:
+        if isinstance(e, litellm.RateLimitError):
+            raise e
+        # 非 RateLimitError 的其他异常（如 Redis 连接失败）
+        return deployment  # 不失败请求，降级处理
+```
+
+**文件位置**: `litellm/router_strategy/lowest_tpm_rpm_v2.py:222-225
+
+---
+
+## 8. 附录 C：补充关键文件位置
+
+| 补充分析 | 文件路径 |
+|---------|---------|
+| 后备链终止逻辑 | `litellm/router_utils/fallback_event_handlers.py:85-161` |
+| 后备信号回调 | `litellm/router_utils/fallback_event_handlers.py:164-229` |
+| 自适应冷启动配置 | `litellm/router_strategy/adaptive_router/config.py` |
+| Beta 分布初始化 | `litellm/router_strategy/adaptive_router/bandit.py:45-80` |
+| Redis 同步机制 | `litellm/router_strategy/base_routing_strategy.py:95-261` |
+| 双层速率检查 | `litellm/router_strategy/lowest_tpm_rpm_v2.py:141-225` |
+
+---
+
 *报告生成时间: 2026-05-01*
+*补充分析更新时间: 2026-05-01*
