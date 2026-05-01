@@ -1676,5 +1676,502 @@ async def async_pre_call_check(
 
 ---
 
+## 9. 修正与深度补充分析
+
+### 9.1 自适应路由偏好接口的实际结构修正
+
+#### 9.1.1 实际源码定义
+
+**修正说明**：之前的分析中对 `AdaptiveRouterPreferences` 的字段描述存在错误。实际源码定义如下：
+
+```python
+# litellm/types/router.py:837-843 实际定义
+
+class AdaptiveRouterPreferences(BaseModel):
+    """model_info.adaptive_router_preferences — declared by each model."""
+
+    model_config = ConfigDict(use_enum_values=False)
+
+    quality_tier: int = Field(ge=1, le=3)
+    strengths: List[RequestType] = Field(default_factory=list)
+```
+
+**文件位置**: `litellm/types/router.py:837-843`
+
+#### 9.1.2 字段说明修正
+
+| 字段 | 类型 | 约束 | 默认值 | 说明 |
+|-----|------|-----|-------|------|
+| **quality_tier** | `int` | `ge=1, le=3` | **无默认值，必须指定** | 质量层级：1=经济型，2=标准型，3=旗舰型 |
+| **strengths** | `List[RequestType]` | 无 | `[]` (空列表) | 模型擅长的请求类型列表 |
+
+**重要修正**：
+- ❌ **错误推断**：之前认为有 `model_cost: float` 字段
+- ✅ **实际情况**：`model_cost` 不存在，成本数据来自 `litellm_params.input_cost_per_token` / `output_cost_per_token`
+
+#### 9.1.3 RequestType 枚举实际成员
+
+```python
+class RequestType(str, enum.Enum):
+    """Fixed v0 taxonomy. User-extensible types come in v1."""
+
+    CODE_GENERATION = "code_generation"
+    CODE_UNDERSTANDING = "code_understanding"
+    TECHNICAL_DESIGN = "technical_design"
+    ANALYTICAL_REASONING = "analytical_reasoning"
+    WRITING = "writing"
+    FACTUAL_LOOKUP = "factual_lookup"
+    GENERAL = "general"
+```
+
+**文件位置**: `litellm/types/router.py:805-814`
+
+#### 9.1.4 配置示例修正
+
+```yaml
+# 实际配置示例（来自 adaptive_router_example.yaml）
+model_list:
+  - model_name: fast
+    litellm_params:
+      model: openai/gpt-4o-mini
+      input_cost_per_token: 0.00000015    # 成本在这里定义，不是在 preferences
+    model_info:
+      adaptive_router_preferences:
+        quality_tier: 2                     # 必须是 1, 2, 3
+        strengths: []                       # 可选，默认空列表
+
+  - model_name: smart
+    litellm_params:
+      model: openai/gpt-4o
+      input_cost_per_token: 0.0000050
+    model_info:
+      adaptive_router_preferences:
+        quality_tier: 3
+        strengths: ["code_generation", "technical_design", "analytical_reasoning"]
+```
+
+**文件位置**: `litellm/proxy/example_config_yaml/adaptive_router_example.yaml`
+
+#### 9.1.5 默认偏好配置
+
+```python
+# adaptive_router.py 中的默认配置
+def _default_prefs() -> AdaptiveRouterPreferences:
+    return AdaptiveRouterPreferences(quality_tier=2, strengths=[])
+```
+
+**文件位置**: `litellm/router_strategy/adaptive_router/adaptive_router.py:67-69`
+
+---
+
+### 9.2 样本上限满后的状态冻结影响分析
+
+#### 9.2.1 硬上限机制源码
+
+```python
+# config.py 中的定义
+SAMPLE_CAP: int = 200  # D5 — Sample cap. Hard cap, no rescaling.
+
+# bandit.py 中的应用逻辑
+def apply_delta(cell: BanditCell, delta_alpha: float, delta_beta: float) -> BanditCell:
+    """
+    Apply a learning update to a cell, enforcing the sample cap.
+    
+    SAMPLE_CAP is a HARD cap on (alpha + beta). When the cap would be exceeded,
+    we drop the update. (D5: hard cap, no rescaling — keep v0 simple.)
+    """
+    new_alpha = cell.alpha + delta_alpha
+    new_beta = cell.beta + delta_beta
+    if new_alpha + new_beta > SAMPLE_CAP:
+        return cell  # 超过上限，直接返回原 cell，丢弃更新
+    return BanditCell(alpha=new_alpha, beta=new_beta)
+```
+
+**文件位置**: `litellm/router_strategy/adaptive_router/bandit.py:69-80`
+
+#### 9.2.2 状态冻结的完整流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    样本上限与状态冻结流程                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  阶段 1: 正常学习 (total_samples < 190)                            │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ BanditCell(alpha=100.0, beta=50.0)                          │ │
+│  │ total_samples = 100 + 50 - 10 = 140 (真实样本数)            │ │
+│  │                                                                │ │
+│  │ apply_delta(1.0, 0.0): 成功更新                             │ │
+│  │   new_alpha = 101.0, new_beta = 50.0                        │ │
+│  │   101 + 50 = 151 <= 200 ✓                                   │ │
+│  │   → 返回新 cell                                              │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  阶段 2: 接近上限 (total_samples ≈ 190)                           │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ BanditCell(alpha=180.0, beta=20.0)                          │ │
+│  │ total_samples = 180 + 20 - 10 = 190                         │ │
+│  │                                                                │ │
+│  │ apply_delta(15.0, 5.0):                                      │ │
+│  │   new_alpha = 195.0, new_beta = 25.0                        │ │
+│  │   195 + 25 = 220 > 200 ✗                                   │ │
+│  │   → 返回原 cell，丢弃 15 成功 + 5 失败 更新                  │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              │                                      │
+│                              ▼                                      │
+│  阶段 3: 状态冻结 (total_samples >= 190)                          │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ BanditCell(alpha=180.0, beta=20.0) ← 冻结状态              │ │
+│  │                                                                │ │
+│  │ 后续所有 apply_delta 调用都被忽略                            │ │
+│  │ 后验参数 alpha/beta 永远保持不变                             │ │
+│  │ 模型的"感知质量"被永久冻结                                   │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.3 模型性能变化时的影响
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│            状态冻结对模型性能变化的影响分析                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  场景 A: 模型从"好"变"坏"                                          │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 时间线:                                                        │ │
+│  │ T0: 模型上线，quality_tier=3                                 │ │
+│  │     → initial_cell: alpha=7.0, beta=3.0, mean=0.7          │ │
+│  │                                                               │ │
+│  │ T1: 运行稳定，190 个真实样本                                 │ │
+│  │     → 假设全部成功: alpha=7+190=197, beta=3, mean=0.985   │ │
+│  │     → 197 + 3 = 200，达到上限                                │ │
+│  │                                                               │ │
+│  │ T2: 模型开始退化（API 质量下降）                             │ │
+│  │     → 真实失败信号不断产生                                    │ │
+│  │     → apply_delta(0.0, 1.0) 被调用                          │ │
+│  │     → new_alpha=197, new_beta=4 → sum=201 > 200           │ │
+│  │     → 直接返回原 cell，失败信号被忽略！                      │ │
+│  │                                                               │ │
+│  │ 结果: 路由器"认为"模型仍有 98.5% 成功率                    │ │
+│  │       实际成功率可能已降至 50%                               │ │
+│  │       但路由器无法感知！                                     │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  场景 B: 模型从"坏"变"好"                                          │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 时间线:                                                        │ │
+│  │ T0: 模型上线，但初期问题多                                   │ │
+│  │     → 假设 100 个样本中 80 失败                            │ │
+│  │     → alpha=7+20=27, beta=3+80=83, mean=27/110≈0.245     │ │
+│  │     → sum=110 < 200，还能学习                              │ │
+│  │                                                               │ │
+│  │ T1: 模型修复，开始变好                                       │ │
+│  │     → 后续 90 个样本全部成功                                │ │
+│  │     → alpha=27+90=117, beta=83, sum=200 达到上限         │ │
+│  │     → mean=117/200≈0.585                                   │ │
+│  │                                                               │ │
+│  │ T2: 模型持续优秀                                             │ │
+│  │     → 继续产生成功信号                                       │ │
+│  │     → 但 apply_delta 被忽略                                 │ │
+│  │                                                               │ │
+│  │ 结果: mean 被冻结在 0.585                                   │ │
+│  │       实际成功率可能已达 95%                                 │ │
+│  │       路由器无法继续学习更新                                 │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.4 对长期运行系统的影响
+
+| 影响维度 | 具体风险 | 严重程度 |
+|---------|---------|---------|
+| **模型退化无法感知** | 高质量模型变低质量后，路由器仍持续路由到它 | 🔴 高 |
+| **模型改进无法感知** | 低质量模型变高质量后，路由器仍避开它 | 🟡 中 |
+| **公平性丧失** | 新模型需要积累样本，老模型有冻结的历史优势 | 🟡 中 |
+| **无法适应变化** | 流量模式变化、用户行为变化时无法调整 | 🔴 高 |
+| **竞争僵化** | 早期成功的模型永久"锁死"路由份额 | 🟡 中 |
+
+#### 9.2.5 设计意图与权衡
+
+```python
+# bandit.py 中的注释说明
+
+def apply_delta(...):
+    """
+    SAMPLE_CAP is a HARD cap on (alpha + beta). When the cap would be exceeded,
+    we drop the update. (D5: hard cap, no rescaling — keep v0 simple.)
+    """
+```
+
+**设计意图**（从代码注释推断）：
+1. **防止过拟合**：旧样本权重过高，新样本无法影响
+2. **保持 v0 简单**：不实现复杂的重缩放（rescaling）逻辑
+3. **硬上限 vs 重缩放**：硬上限实现最简单
+
+**替代方案**（v1 可能采用）：
+```python
+# 可能的重缩放方案（当前未实现）
+def apply_delta_with_rescaling(cell, delta_alpha, delta_beta):
+    new_alpha = cell.alpha + delta_alpha
+    new_beta = cell.beta + delta_beta
+    total = new_alpha + new_beta
+    if total > SAMPLE_CAP:
+        # 按比例缩小，保持均值不变
+        scale = SAMPLE_CAP / total
+        new_alpha = cell.mean * SAMPLE_CAP
+        new_beta = (1.0 - cell.mean) * SAMPLE_CAP
+    return BanditCell(alpha=new_alpha, beta=new_beta)
+```
+
+---
+
+### 9.3 速率计数预增量的无回滚场景分析
+
+#### 9.3.1 不同策略的回滚机制对比
+
+| 策略 | 计数类型 | 预增量时机 | 失败回滚 | 实现位置 |
+|-----|---------|-----------|---------|---------|
+| **LeastBusy** | 进行中请求数 | `log_pre_api_call` | ✅ 有 (`log_failure_event` 中 decrement) | `least_busy.py:24-190` |
+| **LowestTPM v2** | RPM (请求数) | `async_pre_call_check` | ❌ **无** | `lowest_tpm_rpm_v2.py:141-225` |
+| **LowestTPM v2** | TPM (Token 数) | `log_success_event` | N/A (只有成功才更新) | `lowest_tpm_rpm_v2.py:276-325` |
+
+#### 9.3.2 LeastBusy 的完整回滚机制
+
+```python
+# least_busy.py 中的实现
+
+class LeastBusyLoggingHandler(CustomLogger):
+    
+    # ========== 预调用: +1 ==========
+    def log_pre_api_call(self, model, messages, kwargs):
+        """
+        模型被使用时记录。
+        在请求实际发出前调用。
+        """
+        try:
+            model_group = kwargs["litellm_params"]["metadata"].get("model_group", None)
+            id = kwargs["litellm_params"].get("model_info", {}).get("id", None)
+            
+            request_count_api_key = f"{model_group}_request_count"
+            request_count_dict = (
+                self.router_cache.get_cache(key=request_count_api_key) or {}
+            )
+            request_count_dict[id] = request_count_dict.get(id, 0) + 1  # +1
+            self.router_cache.set_cache(
+                key=request_count_api_key, value=request_count_dict
+            )
+        except Exception:
+            pass
+    
+    # ========== 成功: -1 ==========
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        # ...
+        request_count_dict[id] = request_count_value - 1  # -1
+        # ...
+    
+    # ========== 失败: -1 ==========
+    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        """
+        失败时同样 decrement。
+        这是关键的回滚机制！
+        """
+        try:
+            # ... 获取 model_group 和 id ...
+            request_count_api_key = f"{model_group}_request_count"
+            request_count_dict = (
+                self.router_cache.get_cache(key=request_count_api_key) or {}
+            )
+            request_count_value: Optional[int] = request_count_dict.get(id, 0)
+            if request_count_value is None:
+                return
+            request_count_dict[id] = request_count_value - 1  # -1 回滚
+            self.router_cache.set_cache(
+                key=request_count_api_key, value=request_count_dict
+            )
+        except Exception:
+            pass
+    
+    # 异步版本同样有回滚
+    async def async_log_failure_event(self, ...):
+        # 同样 decrement
+        request_count_dict[id] = request_count_value - 1
+```
+
+**文件位置**: `litellm/router_strategy/least_busy.py:24-190`
+
+#### 9.3.3 LowestTPM v2 的 RPM 无回滚机制
+
+```python
+# lowest_tpm_rpm_v2.py 中的实现
+
+class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
+    
+    # ========== 预调用: RPM +1 ==========
+    async def async_pre_call_check(
+        self, deployment: Dict, parent_otel_span: Optional[Span]
+    ) -> Optional[Dict]:
+        """
+        预调用检查 + 更新 RPM 计数。
+        注意：这里在请求发出前就增加了计数！
+        """
+        # ... 本地检查 ...
+        
+        # 本地检查通过后，执行 Redis INCR
+        else:
+            result = await self._increment_value_in_current_window(
+                key=rpm_key, value=1, ttl=self.routing_args.ttl
+            )
+            if result is not None and result > deployment_rpm:
+                raise litellm.RateLimitError(...)
+        
+        return deployment  # 检查通过，计数已增加
+    
+    # ========== 成功: 只更新 TPM ==========
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        """
+        Update TPM usage on success.
+        注意：这里只更新 TPM，不更新 RPM！
+        RPM 在 pre_call_check 中已增加，没有回滚机制。
+        """
+        # ...
+        # 只更新 TPM
+        await self.router_cache.async_increment_cache(
+            key=tpm_key,
+            value=total_tokens,  # TPM 增量
+            ttl=self.routing_args.ttl,
+            ...
+        )
+    
+    # ========== 失败: 无任何处理 ==========
+    # 搜索整个文件，没有找到 log_failure_event 或 async_log_failure_event 的定义！
+    # CustomLogger 基类可能有默认实现，但不会回滚计数。
+```
+
+**文件位置**: `litellm/router_strategy/lowest_tpm_rpm_v2.py:141-325`
+
+#### 9.3.4 无回滚的影响分析
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              RPM 预增量无回滚的风险场景                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  场景: 某部署 RPM 限额 = 100 requests/minute                     │
+│                                                                     │
+│  时间线:                                                            │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ T0: 当前 RPM = 95 (剩余 5)                                 │ │
+│  │                                                               │ │
+│  │ T1: 请求 A 到达                                              │ │
+│  │     → async_pre_call_check: RPM INCR → 96                   │ │
+│  │     → 检查通过 (96 < 100)                                   │ │
+│  │                                                               │ │
+│  │ T2: 请求 A 执行中...                                         │ │
+│  │                                                               │ │
+│  │ T3: 请求 A 失败 (网络超时/API 错误)                         │ │
+│  │     → log_failure_event 被调用                              │ │
+│  │     → 但 LowestTPM v2 没有实现回滚！                        │ │
+│  │     → RPM 保持 96，不会回滚到 95                            │ │
+│  │                                                               │ │
+│  │ T4: 请求 B 到达                                              │ │
+│  │     → RPM INCR → 97                                         │ │
+│  │                                                               │ │
+│  │ T5: 请求 B 也失败                                            │ │
+│  │     → RPM 保持 97                                            │ │
+│  │                                                               │ │
+│  │ ... 重复 5 次失败请求 ...                                    │ │
+│  │                                                               │ │
+│  │ Tn: RPM = 95 + 5 = 100 (全是失败请求消耗的)              │ │
+│  │                                                               │ │
+│  │ 结果:                                                         │ │
+│  │ - 没有一个成功请求                                            │ │
+│  │ - 但 100 RPM 限额已被"失败请求"耗尽                          │ │
+│  │ - 后续正常请求被 RateLimitError 拒绝                         │ │
+│  │ - 直到下一分钟窗口重置                                        │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.3.5 风险量化分析
+
+| 风险类型 | 触发条件 | 影响 | 持续时间 |
+|---------|---------|------|---------|
+| **瞬时耗尽** | 高 QPS + 高失败率 | 配额被失败请求快速耗尽 | 分钟级（直到窗口重置） |
+| **虚假限流** | 失败请求累积到限额 | 正常请求被错误拒绝 | 分钟级 |
+| **跨实例放大** | 多实例部署 + Redis 同步 | 一个实例的失败影响所有实例 | 分钟级 + 同步延迟 |
+| **资源浪费** | 无效请求消耗计数 | 实际可用容量被浪费 | 持续 |
+
+#### 9.3.6 设计意图与对比
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    两种计数策略的设计哲学                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  LeastBusy (进行中请求数):                                         │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 计数含义: 正在进行中的请求数                                  │ │
+│  │ 目标: 负载均衡，选择最不忙的部署                              │ │
+│  │                                                               │ │
+│  │ 为什么需要回滚:                                               │ │
+│  │ - 请求开始: +1 (进入队列)                                    │ │
+│  │ - 请求结束 (成功/失败): -1 (离开队列)                       │ │
+│  │ - 必须回滚，否则计数会无限增长                               │ │
+│  │ - 这是"进行中"计数的本质要求                                 │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  LowestTPM v2 (RPM/TPM 限额):                                     │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ 计数含义: 已消耗的配额量                                      │ │
+│  │ 目标: 速率限制，防止超配额                                    │ │
+│  │                                                               │ │
+│  │ 为什么没有回滚 (设计选择):                                    │ │
+│  │ - RPM 是"请求已尝试"的计数                                   │ │
+│  │ - 即使失败，也"消耗"了一次尝试                               │ │
+│  │ - 这是一种保守策略：假设失败请求也会对服务端造成压力        │ │
+│  │                                                               │ │
+│  │ 但实际问题:                                                   │ │
+│  │ - 失败请求可能完全没有触达服务端 (网络超时)                 │ │
+│  │ - 或服务端返回 5xx，但实际没有消耗配额                      │ │
+│  │ - 此时回滚可能更合理                                         │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.3.7 TPM 与 RPM 的不对称性
+
+| 计数类型 | 更新时机 | 失败影响 | 数据来源 |
+|---------|---------|---------|---------|
+| **RPM** | `async_pre_call_check` (请求前) | ❌ 无回滚，计数已增加 | 预调用增量 |
+| **TPM** | `async_log_success_event` (成功后) | ✅ 不影响，只有成功才更新 | `standard_logging_object.total_tokens` |
+
+**关键不对称性**：
+- **RPM**：保守策略，失败请求也"消耗"配额
+- **TPM**：精确策略，只有实际消耗的 tokens 才计数
+
+---
+
+## 10. 附录 D：修正与补充关键文件位置
+
+| 修正分析 | 文件路径 |
+|---------|---------|
+| AdaptiveRouterPreferences 实际定义 | `litellm/types/router.py:837-843` |
+| RequestType 枚举实际值 | `litellm/types/router.py:805-814` |
+| 样本上限 apply_delta 逻辑 | `litellm/router_strategy/adaptive_router/bandit.py:69-80` |
+| SAMPLE_CAP 配置 | `litellm/router_strategy/adaptive_router/config.py:23` |
+| LeastBusy 回滚机制 | `litellm/router_strategy/least_busy.py:90-121` |
+| LowestTPM v2 RPM 预增量 | `litellm/router_strategy/lowest_tpm_rpm_v2.py:141-225` |
+| LowestTPM v2 无 log_failure_event | 整个 `lowest_tpm_rpm_v2.py` 文件搜索 |
+| 自适应路由配置示例 | `litellm/proxy/example_config_yaml/adaptive_router_example.yaml` |
+
+---
+
 *报告生成时间: 2026-05-01*
 *补充分析更新时间: 2026-05-01*
+*修正与深度补充时间: 2026-05-01*
