@@ -597,6 +597,176 @@ def translate_system_message(
     return anthropic_system_message_list
 ```
 
+### 4.4 参数兼容性处理的双模式设计
+
+LiteLLM 在归一化层处理不被供应商支持的参数时，设计了**双模式处理机制**，通过 `drop_params` 参数控制：
+
+| 模式 | `drop_params` 值 | 行为 | 适用场景 |
+|:---:|:---------------:|-----|---------|
+| **严格模式**（默认） | `False` | 直接抛出 `ValueError` 或 `UnsupportedParamsError` | 开发阶段、需要明确知道参数问题时 |
+| **宽松模式** | `True` | 静默丢弃不支持的参数，继续执行 | 生产环境、需要保证服务可用性时 |
+
+#### 4.4.1 设计原理
+
+这个双模式设计是 LiteLLM 在**可用性**和**可观测性**之间的权衡：
+
+```python
+# 核心实现逻辑（来自 map_openai_params 方法）
+def map_openai_params(
+    self,
+    non_default_params: dict,
+    optional_params: dict,
+    model: str,
+    drop_params: bool,
+) -> dict:
+    supported_params = self.get_supported_openai_params(model)
+    
+    for k in non_default_params.keys():
+        if k not in optional_params.keys():
+            if k in supported_params:
+                # 参数支持，正常传递
+                optional_params[k] = non_default_params[k]
+            elif drop_params:
+                # 参数不支持，但用户允许丢弃 → 静默跳过
+                pass
+            else:
+                # 参数不支持，用户不允许丢弃 → 抛出明确错误
+                raise ValueError(
+                    f"Parameter {k} is not supported for model {model}. "
+                    f"Supported parameters are {supported_params}. "
+                    f"Set drop_params=True to drop unsupported parameters."
+                )
+
+    return optional_params
+```
+
+#### 4.4.2 两种模式的适用场景
+
+**严格模式 (`drop_params=False`) 适用场景**：
+
+| 场景 | 推荐理由 |
+|-----|---------|
+| **新项目开发** | 帮助开发者及时发现参数使用错误 |
+| **调试阶段** | 明确的错误信息便于定位问题 |
+| **单元测试** | 确保测试覆盖所有参数的有效性 |
+| **严格的类型检查** | 需要确保每个参数都被正确处理时 |
+
+**宽松模式 (`drop_params=True`) 适用场景**：
+
+| 场景 | 推荐理由 |
+|-----|---------|
+| **生产环境** | 最大限度保证服务可用性，不因参数问题导致调用失败 |
+| **跨供应商代码** | 同一份代码在不同供应商间切换时，某些参数可能不被部分供应商支持 |
+| **渐进式迁移** | 从某供应商迁移到另一供应商时，避免所有不支持参数都导致错误 |
+| **供应商 API 版本差异** | 同一供应商的不同 API 版本可能支持不同参数 |
+
+#### 4.4.3 配置方式
+
+LiteLLM 支持**全局配置**和**局部配置**两种方式：
+
+```python
+# 方式 1：全局配置（影响所有调用）
+import litellm
+litellm.drop_params = True
+
+# 所有后续调用都会使用宽松模式
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    temperature=0.7,  # 如果不支持，会被静默丢弃
+)
+
+# 方式 2：局部配置（只影响本次调用）
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    temperature=0.7,
+    drop_params=True,  # 只对本次调用生效
+)
+
+# 方式 3：Proxy 配置（在配置文件中设置）
+# dev_config.yaml
+# model_list:
+#   - model_name: my-model
+#     litellm_params:
+#       drop_params: true
+```
+
+#### 4.4.4 实际应用示例
+
+**场景 1：跨供应商代码**
+
+```python
+# 同一份代码需要在多个供应商间切换
+models = [
+    "gpt-4",           # OpenAI：支持 temperature
+    "anthropic/claude-3-opus",  # Anthropic：可能不支持某些参数
+    "bedrock/anthropic.claude-v2",  # Bedrock：可能有不同的参数支持
+]
+
+for model in models:
+    try:
+        response = litellm.completion(
+            model=model,
+            messages=[...],
+            temperature=0.7,
+            max_tokens=1024,
+            tools=[...],
+            drop_params=True,  # 不支持的参数静默丢弃
+        )
+        print(f"成功调用 {model}")
+    except Exception as e:
+        print(f"调用 {model} 失败: {e}")
+```
+
+**场景 2：调试阶段**
+
+```python
+# 开发阶段使用严格模式，确保参数使用正确
+import litellm
+litellm.drop_params = False  # 显式设置为严格模式
+
+try:
+    response = litellm.completion(
+        model="anthropic/claude-3-opus",
+        messages=[...],
+        temperature=2.0,  # 超出有效值范围
+    )
+except ValueError as e:
+    # 会收到明确的错误提示
+    print(f"参数错误: {e}")
+    # 输出: Parameter temperature is not supported for model claude-3-opus.
+    #       Supported parameters are [...]. 
+    #       Set drop_params=True to drop unsupported parameters.
+```
+
+#### 4.4.5 设计权衡分析
+
+| 设计维度 | 严格模式 (`drop_params=False`) | 宽松模式 (`drop_params=True`) |
+|:---:|:-----------------------------|:-----------------------------|
+| **开发者体验** | ✅ 明确告知参数问题，便于调试 | ❌ 静默丢弃，可能隐藏问题 |
+| **生产稳定性** | ❌ 可能因参数不支持导致调用失败 | ✅ 最大限度保证服务可用性 |
+| **参数控制** | ✅ 严格控制，防止意外行为 | ❌ 灵活，但可能产生非预期结果 |
+| **学习曲线** | 📈 需要了解每个供应商支持的参数 | 📉 一次编写，多处运行 |
+| **调试难度** | ✅ 问题明确，易于定位 | ❌ 需要日志追踪才能发现 |
+
+**设计决策的核心考量**：
+
+1. **默认选择严格模式**：
+   - LiteLLM 默认 `drop_params=False`，这是因为"及早发现问题"比"静默失败"更好
+   - 在开发阶段，开发者应该知道哪些参数不被支持
+   - 显式的错误信息帮助用户理解供应商差异
+
+2. **提供宽松模式作为选择**：
+   - 生产环境中，服务可用性是首要目标
+   - 跨供应商代码需要容忍参数差异
+   - 用户可以根据场景选择合适的模式
+
+3. **双重配置机制**：
+   - 全局配置适合统一策略
+   - 局部配置适合特定场景的覆盖
+   - 灵活性和可控性的平衡
+
 ---
 
 ## 5. 响应结构归一化
@@ -1590,6 +1760,223 @@ async def acompletion(
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### 8.6 透传机制 vs 显式参数映射：适用场景对比
+
+LiteLLM 提供了**两种参数传递机制**：
+
+1. **显式参数映射**：通过 `map_openai_params()` 方法，将 OpenAI 标准参数映射到供应商特定格式
+2. **透传机制**：通过 `extra_body` 和 `extra_headers`，直接传递供应商特有参数
+
+这两种机制各有优劣，适用于不同场景。
+
+#### 8.6.1 核心对比
+
+| 维度 | 显式参数映射 | 透传机制 |
+|:---:|:-----------|:---------|
+| **参数来源** | OpenAI 标准参数 | 供应商特有参数 |
+| **处理方式** | LiteLLM 负责格式转换 | 直接透传，不做转换 |
+| **类型安全** | ✅ 有验证和类型检查 | ❌ 无验证，完全依赖供应商 |
+| **跨供应商兼容** | ✅ 一次编写，多处运行 | ❌ 绑定特定供应商 |
+| **更新频率** | 需要 LiteLLM 版本更新 | 即时可用，无需等待 |
+| **适用参数** | `temperature`, `max_tokens`, `tools`, `tool_choice` 等 | `anthropic_beta`, 自定义 header, 实验性功能等 |
+
+#### 8.6.2 显式参数映射：适用场景
+
+**适合使用显式参数映射的情况**：
+
+**1. 标准化的 OpenAI 参数**
+
+```python
+# 这些参数应该使用显式映射
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    temperature=0.7,        # OpenAI 标准参数，Anthropic 支持 (需要映射)
+    max_tokens=1024,        # OpenAI 标准参数，Anthropic 支持
+    tools=[...],            # OpenAI 工具格式，需要转换为 Anthropic 格式
+    tool_choice="auto",     # OpenAI 工具选择，需要转换
+)
+```
+
+**设计原理**：
+- 这些参数是**所有 LLM 供应商都应该支持**的核心功能
+- LiteLLM 负责将 OpenAI 格式转换为各供应商的特有格式
+- 用户无需关心供应商差异，一次编写即可在所有供应商间切换
+
+**2. 需要跨供应商兼容的场景**
+
+```python
+# 同一个代码可以无缝切换不同供应商
+models = [
+    "anthropic/claude-3-opus",
+    "gpt-4",
+    "bedrock/anthropic.claude-v2",
+]
+
+for model in models:
+    response = litellm.completion(
+        model=model,
+        messages=[...],
+        temperature=0.7,      # 所有供应商都支持
+        max_tokens=1024,       # 所有供应商都支持
+    )
+    # 无需修改代码即可切换供应商
+```
+
+**3. 需要类型安全和验证的场景**
+
+```python
+# 显式映射会验证参数值的有效性
+try:
+    response = litellm.completion(
+        model="anthropic/claude-3-opus",
+        messages=[...],
+        temperature=2.0,  # 超出有效值范围 (0-1)
+    )
+except litellm.UnsupportedParamsError as e:
+    # LiteLLM 会提前验证并抛出明确错误
+    print(f"参数错误: {e}")
+```
+
+#### 8.6.3 透传机制：适用场景
+
+**适合使用透传机制的情况**：
+
+**1. 供应商特有功能**
+
+```python
+# Anthropic Prompt Caching（需要传递 anthropic_beta header）
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "这是一个很长的文档...",
+                    "cache_control": {"type": "ephemeral"}  # 需要 extra_body 支持
+                }
+            ]
+        }
+    ],
+    extra_headers={
+        "anthropic-beta": "prompt-caching-2024-07-31"  # 特有 header
+    }
+)
+```
+
+**设计原理**：
+- 这些功能是**特定供应商独有**的，其他供应商不支持
+- LiteLLM 不需要理解这些参数的含义，只需原样传递
+- 用户明确知道自己在使用哪个供应商的特有功能
+
+**2. 实验性或新发布的功能**
+
+```python
+# 假设 Anthropic 刚刚发布了一个新功能，LiteLLM 还未更新
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    extra_body={
+        "new_feature": "value",  # 新功能，LiteLLM 还未支持
+        "experimental_param": True,  # 实验性功能
+    }
+)
+```
+
+**设计原理**：
+- 供应商发布新功能后，用户可以**立即使用**，无需等待 LiteLLM 更新
+- 避免了 LiteLLM 版本滞后于供应商 API 更新的问题
+
+**3. 需要精确控制底层 API 的场景**
+
+```python
+# 高级用户需要精确控制底层请求
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    extra_body={
+        "metadata": {
+            "user_id": "user-123",
+            "trace_id": "trace-456",
+        },
+        "stop_sequences": ["\n\n", "##", "END"],  # 更多控制选项
+    },
+    extra_headers={
+        "X-Request-ID": "req-789",  # 自定义请求追踪
+        "anthropic-version": "2023-06-01",  # 指定 API 版本
+    }
+)
+```
+
+**4. OpenAI 兼容但有扩展的供应商**
+
+```python
+# 某些 OpenAI 兼容供应商有自己的扩展参数
+response = litellm.completion(
+    model="groq/llama-3-70b-8192",
+    messages=[...],
+    extra_body={
+        "groq": {  # Groq 特有扩展
+            "useFp8": True,
+            "promptCache": True,
+        }
+    }
+)
+```
+
+#### 8.6.4 决策指南
+
+| 场景 | 推荐机制 | 理由 |
+|-----|:-------:|-----|
+| 我需要在多个供应商间切换代码 | **显式映射** | 保证兼容性，一次编写多处运行 |
+| 我使用的是 OpenAI 标准参数 | **显式映射** | 类型安全，有验证 |
+| 我需要使用某个供应商的特有功能 | **透传机制** | 灵活，无需等待 LiteLLM 更新 |
+| 我需要使用刚发布的新功能 | **透传机制** | 即时可用 |
+| 我需要精确控制底层 API 调用 | **透传机制** | 完全控制 |
+| 我希望代码尽可能简洁 | **显式映射** | 无需关心供应商差异 |
+| 我在开发通用框架或库 | **显式映射** | 保证跨供应商兼容性 |
+
+#### 8.6.5 最佳实践示例
+
+```python
+# ✅ 推荐：混合使用两种机制
+response = litellm.completion(
+    # 标准参数使用显式映射
+    model="anthropic/claude-3-opus",
+    messages=[...],
+    temperature=0.7,
+    max_tokens=1024,
+    tools=[...],
+    
+    # 特有功能使用透传
+    extra_headers={
+        "anthropic-beta": "prompt-caching-2024-07-31"
+    },
+    extra_body={
+        "metadata": {
+            "user_id": "user-123"
+        }
+    }
+)
+
+# ❌ 不推荐：所有参数都用透传（失去了 LiteLLM 的价值）
+response = litellm.completion(
+    model="anthropic/claude-3-opus",
+    extra_body={
+        "messages": [...],           # 应该用标准 messages 参数
+        "max_tokens": 1024,          # 应该用标准 max_tokens 参数
+        "temperature": 0.7,          # 应该用标准 temperature 参数
+    }
+)
+```
+
+**核心原则**：
+- **尽可能使用标准参数**：获得 LiteLLM 的验证、类型安全和跨供应商兼容性
+- **必要时使用透传**：访问供应商特有功能或新发布的 API
+- **混合使用**：标准参数用显式映射，特有功能用透传
 
 ---
 
