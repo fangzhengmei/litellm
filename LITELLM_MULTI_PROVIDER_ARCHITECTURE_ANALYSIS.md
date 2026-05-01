@@ -272,7 +272,62 @@ if api_base:
             # ... 更多端点匹配
 ```
 
-### 3.3 端点匹配的安全实现
+### 3.3 路由策略的优先级与适用边界
+
+LiteLLM 的三种路由策略并非平等，而是有明确的**优先级顺序**：
+
+| 优先级 | 路由策略 | 触发条件 | 适用边界 |
+|:---:|---------|---------|---------|
+| **1 (最高)** | **显式供应商标识** | 用户显式指定 `custom_llm_provider` 参数 | 所有场景 |
+| **2** | **JSON 配置供应商** | 模型前缀匹配 `JSONProviderRegistry` 中的供应商 | 动态配置的供应商 |
+| **3** | **模型前缀路由** | 模型名称以已知供应商为前缀（如 `"anthropic/claude-3-opus"`） | 需要精确控制供应商时 |
+| **4** | **API Base 端点匹配** | `api_base` 匹配已知 OpenAI 兼容端点 | OpenAI 兼容的 API 服务 |
+| **5 (最低)** | **已知模型列表匹配** | 模型名称在 `litellm.model_list` 中 | 常用模型的便捷使用 |
+
+**关键代码**：`litellm/litellm_core_utils/get_llm_provider_logic.py:153-500`
+
+```python
+# 优先级 1: 显式指定 custom_llm_provider
+if litellm_params and litellm_params.custom_llm_provider:
+    custom_llm_provider = litellm_params.custom_llm_provider
+
+# 优先级 2: JSON 配置供应商（优先于 enum-based provider_list）
+provider_prefix = model.split("/", 1)[0]
+if len(model.split("/")) > 1 and JSONProviderRegistry.exists(provider_prefix):
+    return _get_openai_compatible_provider_info(...)
+
+# 优先级 3: 模型前缀路由
+if (
+    model.split("/", 1)[0] in litellm.provider_list
+    and model.split("/", 1)[0] not in litellm.model_list_set
+    and len(model.split("/")) > 1
+):
+    return _get_openai_compatible_provider_info(...)
+
+# 优先级 4: API Base 端点匹配
+if api_base:
+    for endpoint in litellm.openai_compatible_endpoints:
+        if _endpoint_matches_api_base(endpoint, api_base):
+            # 设置对应供应商...
+
+# 优先级 5: 已知模型列表匹配
+if model in litellm.open_ai_chat_completion_models:
+    custom_llm_provider = "openai"
+elif model in litellm.anthropic_models:
+    custom_llm_provider = "anthropic"
+# ...
+```
+
+**设计权衡**：
+
+| 路由策略 | 优点 | 缺点 |
+|---------|-----|-----|
+| **显式供应商标识** | 最明确，不会有歧义 | 需要额外参数 |
+| **模型前缀路由** | 自描述，无需额外配置 | 模型名称较长 |
+| **API Base 端点匹配** | 适合 OpenAI 兼容服务 | 可能受 URL 注入攻击（已防护） |
+| **已知模型列表匹配** | 使用便捷，名称最短 | 新模型可能未及时更新 |
+
+### 3.4 端点匹配的安全实现
 
 LiteLLM 使用解析后的 URL 进行匹配，而非简单的子字符串搜索，以防止安全漏洞：
 
@@ -1632,4 +1687,127 @@ LiteLLM 采用**渐进式转换**策略，对不同供应商的转换程度不�
 
 **关键代码**：`_endpoint_matches_api_base()`
 
-LiteLLM 没有使用简单
+LiteLLM 没有使用简单的子字符串匹配来识别 API 端点，而是采用了 URL 解析的安全方式：
+
+```python
+# ❌ 不安全的方式（可能被利用）
+if "api.groq.com" in api_base:
+    # 攻击者可以构造: "https://attacker.com/api.groq.com/..."
+    # 导致 API Key 被发送到攻击者服务器
+
+# ✅ 安全的方式（LiteLLM 采用）
+def _endpoint_matches_api_base(endpoint: str, api_base: str) -> bool:
+    parsed_endpoint = _parse(endpoint)
+    parsed_url = _parse(api_base)
+    
+    # 主机名必须精确匹配
+    if parsed_endpoint.hostname != parsed_url.hostname:
+        return False
+    
+    # 路径必须以端点路径开头
+    return url_path.startswith(endpoint_path)
+```
+
+这种设计防止了 URL 注入攻击，保护用户的 API Key 安全。
+
+#### 3. 可扩展的异常检测
+
+`ExceptionCheckers` 类采用了**组合式**的异常检测策略：
+
+- **状态码检测**：基于 HTTP 状态码的映射
+- **字符串模式匹配**：基于错误消息中的关键字
+- **供应商特定规则**：不同供应商有不同的错误消息格式
+
+这种设计使得异常检测可以独立于供应商实现进行扩展。
+
+#### 4. 统一的流式抽象
+
+`BaseModelResponseIterator` 基类统一处理了：
+
+- **SSE 格式解析**：所有供应商都使用 SSE 或类似格式
+- **同步/异步双支持**：`__next__` 和 `__anext__` 方法
+- **结束标记检测**：`[DONE]` 标记的统一处理
+- **Chunk 解析抽象**：各供应商实现 `chunk_parser()` 方法
+
+### 9.4 关键文件索引
+
+| 功能模块 | 文件路径 | 关键类/函数 |
+|---------|---------|------------|
+| 基类抽象 | `litellm/llms/base_llm/chat/transformation.py` | `BaseConfig` |
+| 模型路由 | `litellm/litellm_core_utils/get_llm_provider_logic.py` | `get_llm_provider()`, `_endpoint_matches_api_base()` |
+| OpenAI 实现 | `litellm/llms/openai/chat/gpt_transformation.py` | `OpenAIGPTConfig` |
+| Anthropic 实现 | `litellm/llms/anthropic/chat/transformation.py` | `AnthropicConfig` |
+| 异常映射 | `litellm/litellm_core_utils/exception_mapping_utils.py` | `exception_type()`, `ExceptionCheckers` |
+| 流式处理 | `litellm/llms/base_llm/base_model_iterator.py` | `BaseModelResponseIterator` |
+| 主入口 | `litellm/main.py` | `completion()`, `acompletion()` |
+| 异常类型 | `litellm/exceptions.py` | `RateLimitError`, `ContextWindowExceededError` 等 |
+
+### 9.5 扩展新供应商的步骤
+
+基于架构分析，添加新供应商需要以下步骤：
+
+1. **创建配置类**：继承 `BaseConfig`，实现所有抽象方法
+2. **添加模型列表**：将新供应商的模型添加到对应的模型列表中
+3. **更新路由逻辑**：在 `get_llm_provider()` 中添加供应商识别逻辑
+4. **实现异常映射**：在 `exception_type()` 中添加供应商特定的异常检测
+5. **添加测试**：在 `tests/` 目录中添加单元测试和集成测试
+
+### 9.6 总结
+
+LiteLLM 的多模型供应商适配架构展现了优秀的软件设计：
+
+1. **面向抽象编程**：通过 `BaseConfig` 抽象类定义统一接口
+2. **多态实现**：各供应商根据自身 API 特性实现差异化逻辑
+3. **分层架构**：路由层、转换层、归一化层职责清晰
+4. **安全优先**：URL 匹配、API Key 处理等方面都考虑了安全性
+5. **可扩展性**：新供应商的添加遵循明确的扩展点
+
+这种架构使得 LiteLLM 能够支持 100+ 不同的 AI 服务供应商，同时对外提供一致的 OpenAI 兼容接口，大大简化了多模型应用的开发和维护。
+
+---
+
+## 附录
+
+### A. 核心类继承关系
+
+```
+BaseConfig (ABC)
+├── OpenAIGPTConfig
+│   ├── AzureOpenAIConfig
+│   └── OpenAILikeConfig
+├── AnthropicConfig
+│   ├── BedrockAnthropicConfig
+│   └── VertexAIAnthropicConfig
+├── BedrockConverseConfig
+├── VertexAIConfig
+├── GeminiConfig
+├── CohereConfig
+├── MistralConfig
+└── ... (100+ 其他供应商)
+```
+
+### B. 异常类型层次结构
+
+```
+APIError (基类)
+├── APIConnectionError
+├── AuthenticationError
+├── BadRequestError
+│   ├── ContextWindowExceededError
+│   ├── ContentPolicyViolationError
+│   └── BudgetExceededError
+├── NotFoundError
+├── PermissionDeniedError
+├── RateLimitError
+├── Timeout
+├── BadGatewayError
+├── ServiceUnavailableError
+├── InternalServerError
+└── UnprocessableEntityError
+```
+
+### C. 参考资源
+
+- LiteLLM 官方文档：https://docs.litellm.ai/
+- LiteLLM GitHub：https://github.com/BerriAI/litellm
+- OpenAI API 文档：https://platform.openai.com/docs/api-reference
