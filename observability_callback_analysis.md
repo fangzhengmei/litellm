@@ -5,8 +5,9 @@
 1. [概述](#概述)
 2. [支持的可观测性平台集成](#支持的可观测性平台集成)
 3. [回调注册机制](#回调注册机制)
-4. [异步日志事件处理流程](#异步日志事件处理流程)
-5. [架构总结](#架构总结)
+4. [动态回调的双通道触发机制](#动态回调的双通道触发机制)
+5. [异步日志事件处理流程](#异步日志事件处理流程)
+6. [架构总结](#架构总结)
 
 ---
 
@@ -224,7 +225,7 @@ def _check_callback_list_size(self, parent_list) -> bool:
     return True
 ```
 
-**⚠️ 重要修正**: 默认回调数量上限是 **100**，不是 30。可通过环境变量 `LITELLM_MAX_CALLBACKS` 覆盖。
+**⚠️ 注意**: 默认回调数量上限是 **100**，可通过环境变量 `LITELLM_MAX_CALLBACKS` 覆盖。
 
 **2.4 Generic API 回调支持**
 
@@ -286,13 +287,272 @@ response = await litellm.acompletion(
 )
 ```
 
-### 4. 回调执行优先级
+### 4. 回调合并与执行顺序
 
-回调执行的优先级顺序（从高到低）：
+#### ⚠️ 重要修正：回调合并顺序不保证
 
-1. **动态回调** (`dynamic_async_success_callbacks` 等) - 单次调用指定的
-2. **全局异步回调** (`litellm._async_success_callback`) - 通过 LoggingWorker 异步执行
-3. **全局同步回调** (`litellm.success_callback`) - 在主线程同步执行
+**之前的错误描述**：回调按动态回调 → 全局异步回调 → 全局同步回调的优先级顺序执行
+
+**实际情况**：回调合并时使用 `set()` 去重，**顺序不被保证**。
+
+```python
+# litellm_logging.py:3294-3299
+def get_combined_callback_list(
+    self, dynamic_success_callbacks: Optional[List], global_callbacks: List
+) -> List:
+    if dynamic_success_callbacks is None:
+        return list(global_callbacks)
+    return list(set(dynamic_success_callbacks + global_callbacks))  # ⚠️ 使用 set() 去重！
+```
+
+**关键发现**：
+1. `set()` 是无序的，因此回调的执行顺序**不固定**
+2. `set()` 会自动去重，所以即使同一个回调出现在动态回调和全局回调中，也只会执行一次
+3. 如果需要固定执行顺序，不应依赖合并后的顺序
+
+#### 两条独立的执行通道
+
+LiteLLM 有**两条独立的执行通道**，每条通道都有自己的回调合并逻辑：
+
+| 通道 | 触发时机 | 回调源 | 合并方式 |
+|------|---------|--------|---------|
+| **同步通道** (`success_handler`) | 同步调用或异步调用中同步执行 | `dynamic_success_callbacks` + `litellm.success_callback` | `list(set(...))` 去重 |
+| **异步通道** (`async_success_handler`) | 仅异步调用或 Proxy 中通过 LoggingWorker 执行 | `dynamic_async_success_callbacks` + `litellm._async_success_callback` | `list(set(...))` 去重 |
+
+**代码位置**：
+- 同步通道：`litellm_logging.py:2073-2076`
+- 异步通道：`litellm_logging.py:2640-2643`
+
+---
+
+## 动态回调的双通道触发机制
+
+### 1. 什么是动态回调
+
+动态回调是指**在单次 API 调用时通过参数指定的回调**，只对该次调用生效：
+
+```python
+# 动态回调示例
+response = litellm.completion(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello"}],
+    success_callback=["langfuse"],  # 动态回调 - 仅本次调用
+    failure_callback=["posthog"]
+)
+```
+
+### 2. `_known_custom_logger_compatible_callbacks` 列表
+
+LiteLLM 预定义了一个"已知兼容回调"列表，这些回调字符串会被特殊处理：
+
+```python
+# litellm/__init__.py:102-152
+_known_custom_logger_compatible_callbacks = [
+    "lago", "openmeter", "logfire", "literalai",
+    "litellm_agent", "dynamic_rate_limiter", "dynamic_rate_limiter_v3",
+    "langsmith", "prometheus", "otel", 
+    "datadog", "datadog_metrics", "datadog_llm_observability",
+    "galileo", "braintrust", "arize", "arize_phoenix", "langtrace",
+    "gcs_bucket", "azure_storage", "opik", "argilla", "mlflow",
+    "langfuse", "langfuse_otel", "weave_otel",
+    "pagerduty", "humanloop", "azure_sentinel", "gcs_pubsub", "agentops",
+    "anthropic_cache_control_hook", "generic_api",
+    "resend_email", "sendgrid_email", "smtp_email",
+    "deepeval", "s3_v2", "aws_sqs", 
+    "vector_store_pre_call_hook", "dotprompt",
+    "bitbucket", "gitlab", "cloudzero", "focus", "vantage", "posthog", "levo",
+    "compression_interception"
+]
+```
+
+### 3. 双通道触发机制的核心代码
+
+当动态回调是上述列表中的字符串时，会被**自动添加到同步和异步两条通道**：
+
+```python
+# litellm_logging.py:456-497
+def _process_dynamic_callback_list(
+    self,
+    callback_list: Optional[List[Union[str, Callable, CustomLogger]]],
+    dynamic_callbacks_type: Literal[
+        "input", "success", "failure", "async_success", "async_failure"
+    ],
+) -> Optional[List[Union[str, Callable, CustomLogger]]]:
+    """
+    - 如果回调在 litellm._known_custom_logger_compatible_callbacks 中，
+      将字符串替换为初始化的回调类实例。
+    - 如果动态回调是 "success" 类型且是已知兼容回调，同时添加到 dynamic_async_success_callbacks
+    - 如果动态回调是 "failure" 类型且是已知兼容回调，同时添加到 dynamic_failure_callbacks
+    """
+    if callback_list is None:
+        return None
+
+    processed_list: List[Union[str, Callable, CustomLogger]] = []
+    for callback in callback_list:
+        if (
+            isinstance(callback, str)
+            and callback in litellm._known_custom_logger_compatible_callbacks
+        ):
+            callback_class = _init_custom_logger_compatible_class(
+                callback, internal_usage_cache=None, llm_router=None
+            )
+            if callback_class is not None:
+                processed_list.append(callback_class)
+
+                # ⚠️ 关键：双通道触发！
+                # 如果处理的是 success 类型的动态回调，
+                # 同时添加到 dynamic_async_success_callbacks
+                if dynamic_callbacks_type == "success":
+                    if self.dynamic_async_success_callbacks is None:
+                        self.dynamic_async_success_callbacks = []
+                    self.dynamic_async_success_callbacks.append(callback_class)
+                
+                # 同样，failure 类型会添加到 dynamic_async_failure_callbacks
+                elif dynamic_callbacks_type == "failure":
+                    if self.dynamic_async_failure_callbacks is None:
+                        self.dynamic_async_failure_callbacks = []
+                    self.dynamic_async_failure_callbacks.append(callback_class)
+        else:
+            # 非字符串或非已知兼容回调，只添加到当前通道
+            processed_list.append(callback)
+    return processed_list
+```
+
+### 4. 双通道触发流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    用户调用 with 动态回调                                   │
+│  litellm.acompletion(model="gpt-3.5", messages=[...],                    │
+│                      success_callback=["langfuse"])                        │
+└─────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│              Logging 类初始化时处理动态回调                                 │
+│  _process_dynamic_callback_list()                                          │
+└─────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    检查回调类型                                             │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  回调是字符串且在 _known_custom_logger_compatible_callbacks 中？       │  │
+│  └─────────────────────────────┬───────────────────────────────────────┘  │
+│                                │                                           │
+│          ┌─────────────────────┴─────────────────────┐                   │
+│          │                                             │                   │
+│          ▼                                             ▼                   │
+│  ┌─────────────────┐                    ┌───────────────────────────────┐ │
+│  │ 是              │                    │ 否                            │ │
+│  │                 │                    │                               │ │
+│  │ 执行：          │                    │ 执行：                         │ │
+│  │ 1. 初始化为类实例│                    │ 1. 保持原样（函数/CustomLogger）│ │
+│  │ 2. 添加到       │                    │ 2. 只添加到当前通道            │ │
+│  │    dynamic_     │                    │                               │ │
+│  │    success_     │                    │                               │ │
+│  │    callbacks    │                    │                               │ │
+│  │ 3. 同时添加到   │                    │                               │ │
+│  │    dynamic_     │                    │                               │ │
+│  │    async_       │                    │                               │ │
+│  │    success_     │                    │                               │ │
+│  │    callbacks    │                    │                               │ │
+│  └─────────────────┘                    └───────────────────────────────┘ │
+└─────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         调用完成后的回调执行                                │
+│                                                                             │
+│  ┌─────────────────────────────────┐    ┌───────────────────────────────┐ │
+│  │ 同步通道 (success_handler)      │    │ 异步通道 (async_success_      │ │
+│  │                                 │    │ handler)                      │ │
+│  │ 回调列表：                      │    │                               │ │
+│  │ get_combined_callback_list(    │    │ 回调列表：                    │ │
+│  │   dynamic_success_callbacks,   │    │ get_combined_callback_list(  │ │
+│  │   litellm.success_callback     │    │   dynamic_async_success_     │ │
+│  │ )                               │    │   callbacks,                  │ │
+│  │                                 │    │   litellm._async_success_    │ │
+│  │ ⚠️ 包含动态注册的 langfuse      │    │   callback                    │ │
+│  │                                 │    │ )                             │ │
+│  │ 执行方式：                      │    │                               │ │
+│  │ 主线程同步执行                  │    │ ⚠️ 也包含动态注册的 langfuse│ │
+│  │                                 │    │                               │ │
+│  │ 触发时机：                      │    │ 执行方式：                    │ │
+│  │ - 同步 completion() 调用       │    │ 通过 LoggingWorker 异步执行  │ │
+│  │ - 异步 acompletion() 也会调用  │    │                               │ │
+│  │   (通过 handle_sync_success_   │    │ 触发时机：                    │ │
+│  │    callbacks_for_async_calls)  │    │ - 仅异步 acompletion() 调用  │ │
+│  │                                 │    │ - 或 Proxy 服务器请求        │ │
+│  └─────────────────────────────────┘    └───────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5. 实际行为示例
+
+#### 示例1: 已知兼容回调作为动态回调
+
+```python
+import litellm
+
+litellm.success_callback = ["prometheus"]  # 全局同步回调
+litellm._async_success_callback = ["datadog"]  # 全局异步回调
+
+# 单次调用时指定动态回调
+response = await litellm.acompletion(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello"}],
+    success_callback=["langfuse"]  # 动态回调，langfuse 是已知兼容回调
+)
+```
+
+**实际执行的回调**：
+
+| 通道 | 合并后的回调列表 | 执行方式 |
+|------|-----------------|---------|
+| **同步通道** | `{"langfuse", "prometheus"}` 去重 → 顺序不固定 | 主线程同步执行 |
+| **异步通道** | `{"langfuse", "datadog"}` 去重 → 顺序不固定 | LoggingWorker 异步执行 |
+
+**关键发现**：`langfuse` 会在**两条通道都被执行**！
+
+#### 示例2: 自定义回调作为动态回调
+
+```python
+from litellm.integrations.custom_logger import CustomLogger
+
+class MyCustomLogger(CustomLogger):
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        print(f"[SYNC] Custom logger called")
+    
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        print(f"[ASYNC] Custom logger called")
+
+# 动态回调使用自定义 Logger 实例
+my_logger = MyCustomLogger()
+response = await litellm.acompletion(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello"}],
+    success_callback=[my_logger]  # 动态回调，不是字符串
+)
+```
+
+**实际执行的回调**：
+
+| 通道 | 合并后的回调列表 | 执行的方法 |
+|------|-----------------|-----------|
+| **同步通道** | `{my_logger, ...}` | `my_logger.log_success_event()` |
+| **异步通道** | 不包含 my_logger | ❌ 不会执行 `async_log_success_event()` |
+
+**关键发现**：自定义 `CustomLogger` 实例**不会自动添加到异步通道**！
+
+### 6. 不同调用方式下的行为差异
+
+| 调用方式 | 同步通道 | 异步通道 |
+|---------|---------|---------|
+| `completion()` (同步) | ✅ 执行动态 + 全局同步回调 | ❌ 不执行（除特殊处理的 `openmeter`） |
+| `acompletion()` (异步) | ✅ 执行（通过 `handle_sync_success_callbacks_for_async_calls`） | ✅ 执行（通过 LoggingWorker） |
+| Proxy 服务器请求 | ✅ 执行 | ✅ 执行 |
 
 ---
 
@@ -311,61 +571,59 @@ response = await litellm.acompletion(
 │                     Logging 类 (litellm_logging.py:290)                 │
 │  - 构建 StandardLoggingPayload                                             │
 │  - 计算 response_cost                                                      │
+│  - 处理动态回调的双通道注册 (_process_dynamic_callback_list)              │
 │  - 准备回调执行                                                             │
 └─────────────────────────────┬─────────────────────────────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│              _client_async_logging_helper (utils.py:1176)               │
-│  - 仅在异步调用路径中被触发                                                 │
-│  - 将 async_success_handler 包装为 coroutine                              │
-│  - 提交给 GLOBAL_LOGGING_WORKER (logging_worker.py:533)                 │
-└─────────────────────────────┬─────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   LoggingWorker (logging_worker.py:32)                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  asyncio.Queue (LoggingTask)                                         │  │
-│  │  ┌─────────┬─────────┬─────────┬─────────┬─────────┐              │  │
-│  │  │ Task 1  │ Task 2  │ Task 3  │  ...    │ Task N  │              │  │
-│  │  └─────────┴─────────┴─────────┴─────────┴─────────┘              │  │
-│  │                         ▲                                             │  │
-│  │                         │ enqueue()                                   │  │
-│  └─────────────────────────┼─────────────────────────────────────────────┘  │
-│                            │                                                │
-│                            ▼                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  _worker_loop() + Semaphore 并发控制                                  │  │
-│  │  - 从 Queue 获取任务                                                   │  │
-│  │  - 通过 contextvars 恢复原始上下文                                     │  │
-│  │  - 执行 coroutine (带超时控制)                                         │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬─────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      async_success_handler()                              │
-│  (litellm_logging.py:2478)                                               │
-│  - 遍历 litellm._async_success_callback + dynamic_async_success_callbacks │
-│  - 对每个 CustomLogger 调用 async_log_success_event()                     │
-│  - 处理流式响应的特殊逻辑                                                   │
-└─────────────────────────────┬─────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      外部可观测性平台                                      │
-│  LangFuse ──►  API / SDK 调用                                             │
-│  Prometheus ──► Counter/Histogram 更新                                    │
-│  Datadog ──► 批量提交 + 定时 flush                                         │
-│  S3 ──► 对象存储写入                                                        │
-│  ... 等 50+ 平台                                                           │
-└─────────────────────────────────────────────────────────────────────────┘
+                              ├──────────────────────────────────────────────┐
+                              │                                              │
+                              ▼                                              ▼
+┌─────────────────────────────────────────────┐  ┌─────────────────────────────────────────────┐
+│           同步通道 (Sync Channel)            │  │           异步通道 (Async Channel)          │
+│                                              │  │                                              │
+│  success_handler()                           │  │  async_success_handler()                     │
+│  (litellm_logging.py:2007)                  │  │  (litellm_logging.py:2478)                  │
+│                                              │  │                                              │
+│  回调列表：                                   │  │  回调列表：                                   │
+│  - dynamic_success_callbacks                 │  │  - dynamic_async_success_callbacks           │
+│    (包含：动态注册的已知兼容回调)            │  │    (包含：动态注册的已知兼容回调 +          │
+│  - litellm.success_callback                  │  │     动态注册的 success 类型兼容回调)        │
+│    (全局同步回调)                            │  │  - litellm._async_success_callback          │
+│                                              │  │    (全局异步回调)                            │
+│  合并方式：list(set(...)) 去重               │  │                                              │
+│  ⚠️ 顺序不固定                               │  │  合并方式：list(set(...)) 去重              │
+│                                              │  │  ⚠️ 顺序不固定                              │
+│  执行方式：主线程同步执行                    │  │                                              │
+│                                              │  │  执行方式：通过 LoggingWorker 异步执行       │
+│  触发时机：                                  │  │                                              │
+│  - 同步 completion() 调用                   │  │  触发时机：                                  │
+│  - 异步 acompletion() 也会触发             │  │  - 仅异步 acompletion() 调用                │
+│    (handle_sync_success_callbacks_for_      │  │  - Proxy 服务器请求                          │
+│     async_calls)                            │  │                                              │
+└─────────────────────────────────────────────┘  └─────────────────────────────┬───────────────┘
+                                                                               │
+                                                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                         LoggingWorker (logging_worker.py:32)                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  asyncio.Queue (LoggingTask)                                                             │  │
+│  │  ┌─────────┬─────────┬─────────┬─────────┬─────────┐                                  │  │
+│  │  │ Task 1  │ Task 2  │ Task 3  │  ...    │ Task N  │                                  │  │
+│  │  └─────────┴─────────┴─────────┴─────────┴─────────┘                                  │  │
+│  │                                                                                           │  │
+│  │  配置参数 (默认值)：                                                                       │  │
+│  │  - 并发数: 100 (LOGGING_WORKER_CONCURRENCY)                                            │  │
+│  │  - 队列大小: 50,000 (LOGGING_WORKER_MAX_QUEUE_SIZE)                                   │  │
+│  │  - 单任务超时: 20秒 (LOGGING_WORKER_MAX_TIME_PER_COROUTINE)                            │  │
+│  │  - 清理百分比: 50% (LOGGING_WORKER_CLEAR_PERCENTAGE)                                   │  │
+│  │  - 清理冷却: 0.5秒 (LOGGING_WORKER_AGGRESSIVE_CLEAR_COOLDOWN_SECONDS)                 │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2. LoggingWorker 核心实现
 
-#### 2.1 核心配置参数 (修正后)
+#### 2.1 核心配置参数
 
 ```python
 # 常量定义 (constants.py:476-489)
@@ -391,14 +649,6 @@ MAX_TIME_TO_CLEAR_QUEUE = float(
     os.getenv("MAX_TIME_TO_CLEAR_QUEUE", 5.0)                # 默认最大清理时间: 5秒
 )
 ```
-
-**⚠️ 重要修正**:
-| 参数 | 错误值 | 正确值 |
-|------|--------|--------|
-| `LOGGING_WORKER_CONCURRENCY` | 10 | **100** |
-| `LOGGING_WORKER_MAX_QUEUE_SIZE` | 1000 | **50,000** |
-| `LOGGING_WORKER_MAX_TIME_PER_COROUTINE` | 60.0 秒 | **20.0 秒** |
-| `LOGGING_WORKER_AGGRESSIVE_CLEAR_COOLDOWN_SECONDS` | 1.0 秒 | **0.5 秒** |
 
 #### 2.2 任务入队机制
 
@@ -474,38 +724,48 @@ async def _process_log_task(self, task: LoggingTask, sem: asyncio.Semaphore):
 #### 3.1 异步调用路径 (acompletion) - 推荐
 
 ```
-1. 用户调用 litellm.acompletion(...)
+1. 用户调用 litellm.acompletion(
+       model="gpt-3.5-turbo",
+       messages=[...],
+       success_callback=["langfuse"]  # 动态回调
+   )
    │
    ▼
-2. 实际 LLM API 调用完成
+2. Logging 类初始化
+   │
+   ├──► _process_dynamic_callback_list("langfuse", "success")
+   │       │
+   │       ├──► "langfuse" 是 known_custom_logger_compatible_callbacks
+   │       ├──► 初始化为 LangFuseLogger 实例
+   │       ├──► 添加到 dynamic_success_callbacks (同步通道)
+   │       └──► 同时添加到 dynamic_async_success_callbacks (异步通道)
    │
    ▼
-3. _client_async_logging_helper() 被调用 (utils.py:1176)
+3. 实际 LLM API 调用完成
    │
-   ├──► 检查是否是 completion_with_fallbacks（防止重复日志）
+   ├──► 同步通道触发 (handle_sync_success_callbacks_for_async_calls)
+   │       │
+   │       ├──► get_combined_callback_list(
+   │       │       dynamic_success_callbacks=["langfuse"],
+   │       │       global_callbacks=litellm.success_callback
+   │       │   )
+   │       │
+   │       └──► 主线程同步执行每个 callback 的 log_success_event()
    │
-   └──► 提交到 GLOBAL_LOGGING_WORKER (utils.py:1192-1198):
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-            async_coroutine=logging_obj.async_success_handler(...)
-        )
-   │
-   └──► 同时同步调用同步回调 (utils.py:1203-1207):
-        logging_obj.handle_sync_success_callbacks_for_async_calls(...)
-   │
-   ▼
-4. LoggingWorker 后台处理
-   │
-   ├──► enqueue() → 放入 asyncio.Queue (默认最大 50,000)
-   │
-   └──► _worker_loop() 消费队列 (默认并发 100)
-        │
-        └──► 执行 async_success_handler()
-             │
-             ├──► 遍历所有 async callbacks
-             │
-             └──► 调用每个 callback 的 async_log_success_event()
-                  │
-                  └──► 发送到外部平台（LangFuse, Datadog 等）
+   └──► 异步通道触发 (_client_async_logging_helper)
+           │
+           ├──► GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
+           │       async_coroutine=logging_obj.async_success_handler(...)
+           │   )
+           │
+           └──► LoggingWorker 后台异步执行
+                   │
+                   └──► get_combined_callback_list(
+                           dynamic_async_success_callbacks=["langfuse"],
+                           global_callbacks=litellm._async_success_callback
+                       )
+                   │
+                   └──► 异步执行每个 callback 的 async_log_success_event()
 ```
 
 #### 3.2 同步调用路径 (completion) - 关键行为
@@ -518,54 +778,39 @@ async def _process_log_task(self, task: LoggingTask, sem: asyncio.Semaphore):
 │                                                                             │
 │  调用 success_handler() (litellm_logging.py:2007)                         │
 │                                                                             │
-│  回调执行列表 (来自 get_combined_callback_list, line 2073-2076):          │
-│    - dynamic_success_callbacks (单次调用指定的回调)                          │
-│    - litellm.success_callback (全局同步回调)                                │
-│                                                                             │
-│  ⚠️ 注意: 不包含 litellm._async_success_callback！                          │
-│                                                                             │
 └─────────────────────────────┬─────────────────────────────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    例外情况：特殊回调的特殊处理                              │
-│                                                                             │
-│  在 success_handler() 中有针对某些回调的特殊处理（即使它们在异步列表中）：     │
-│                                                                             │
-│  1. openmeter (line 2383):                                                 │
-│     if callback == "openmeter" and is_sync_request:                       │
-│         openMeterLogger.log_success_event(...)                             │
-│                                                                             │
-│  2. dynamodb (在 LoggingCallbackManager.add_litellm_success_callback 中)  │
-│     会被自动路由到 _async_success_callback                                  │
-│     ⚠️ 但在同步调用的 success_handler 中没有特殊处理！                       │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────┘
+                              ├──────────────────────────────────────────────┐
+                              │                                              │
+                              ▼                                              ▼
+┌─────────────────────────────────────────────┐  ┌─────────────────────────────────────────────┐
+│           同步通道执行                        │  │           异步通道状态                        │
+│                                              │  │                                              │
+│  回调列表：                                   │  │  ⚠️ 不会触发！                                │
+│  - dynamic_success_callbacks                 │  │                                              │
+│  - litellm.success_callback                  │  │  原因：                                       │
+│                                              │  │  1. _client_async_logging_helper 是 async def │
+│  合并方式：list(set(...)) 去重               │  │  2. 同步 completion() 不会调用它              │
+│  ⚠️ 顺序不固定                               │  │  3. async_success_handler 不会被调用          │
+│                                              │  │                                              │
+│  执行方式：主线程同步执行                    │  │  例外：                                       │
+│                                              │  │  - "openmeter" 在 success_handler 中有特殊处理 │
+│  触发条件：总是执行                          │  │    (line 2383)                                │
+│                                              │  │  - 但它是同步执行，不是通过 LoggingWorker     │
+└─────────────────────────────────────────────┘  └─────────────────────────────────────────────┘
 ```
 
 **关键结论：**
 
-| 调用类型 | 执行的回调列表 |
-|---------|---------------|
-| **acompletion** (异步) | 1. `litellm._async_success_callback` (通过 LoggingWorker 异步)<br>2. `litellm.success_callback` (同步)<br>3. 动态回调 |
-| **completion** (同步) | 1. `litellm.success_callback` (同步)<br>2. 动态回调<br>3. **特例**: `openmeter` 会被特殊处理<br>⚠️ **不执行** `litellm._async_success_callback` |
-
-**同步调用时异步回调不触发的原因：**
-
-1. `_client_async_logging_helper` (utils.py:1176) 是一个 `async def` 函数
-2. 它只在异步调用路径中通过 `asyncio.create_task()` 调用 (utils.py:1971-1979)
-3. 同步 `completion()` 不会调用这个函数
-4. `success_handler()` 只组合 `success_callback`，不包含 `_async_success_callback`
+| 调用类型 | 同步通道 | 异步通道 |
+|---------|---------|---------|
+| **acompletion** (异步) | ✅ 执行 (dynamic_success_callbacks + success_callback) | ✅ 执行 (dynamic_async_success_callbacks + _async_success_callback) |
+| **completion** (同步) | ✅ 执行 (dynamic_success_callbacks + success_callback) | ❌ 不执行 (除 "openmeter" 特殊处理) |
 
 **特殊回调 "openmeter" 的行为：**
-- 在 `LoggingCallbackManager.add_litellm_success_callback()` 中，`openmeter` 会被自动添加到 `_async_success_callback`
-- 但在同步调用的 `success_handler()` (line 2383) 中，它被特殊处理：`if callback == "openmeter" and is_sync_request:`
-- 这意味着 `openmeter` 在同步调用时也会被执行，但**是同步执行**的，而不是通过 `LoggingWorker`
-
-**建议：**
-- 如果使用 `acompletion()` 异步调用，所有回调都会正确执行（同步回调同步执行，异步回调通过 LoggingWorker 执行）
-- 如果使用 `completion()` 同步调用，建议将回调注册到 `success_callback` 而不是依赖 `_async_success_callback`
-- 或者直接使用 `acompletion()` 以获得最佳的回调行为一致性
+- 在 `LoggingCallbackManager.add_litellm_success_callback()` 中，`openmeter` 和 `dynamodb` 会被自动添加到 `_async_success_callback`
+- 但在同步调用的 `success_handler()` (line 2383) 中，**只有 `openmeter`** 被特殊处理，会同步执行
+- `dynamodb` 在同步调用中 **不会** 被执行
 
 ### 4. StandardLoggingPayload 标准化
 
@@ -726,19 +971,23 @@ def _flush_on_exit(self):
 - `CustomLogger` 基类提供丰富的钩子方法
 - 支持字符串、函数、类实例三种回调形式
 
-### 2. 关键代码位置参考 (修正后)
+**1.5 动态回调的双通道设计**
+- 已知兼容回调作为动态回调时，会自动添加到同步和异步两条通道
+- 确保单次调用指定的回调能被完整执行
+
+### 2. 关键代码位置参考
 
 | 组件 | 文件路径 | 主要职责 |
 |------|---------|---------|
 | Logging (核心日志类) | `litellm/litellm_core_utils/litellm_logging.py:290` | 定义 `class Logging`，包含 `success_handler` (line 2007) 和 `async_success_handler` (line 2478) |
+| get_combined_callback_list | `litellm/litellm_core_utils/litellm_logging.py:3294` | 合并动态回调和全局回调，使用 `set()` 去重 |
+| _process_dynamic_callback_list | `litellm/litellm_core_utils/litellm_logging.py:456` | 处理动态回调，实现双通道触发机制 |
 | LoggingCallbackManager | `litellm/litellm_core_utils/logging_callback_manager.py` | 回调注册、路由、去重 |
 | LoggingWorker | `litellm/litellm_core_utils/logging_worker.py:32` | 异步任务队列执行；全局单例 `GLOBAL_LOGGING_WORKER` 定义在 line 533 |
 | CustomLogger (基类) | `litellm/integrations/custom_logger.py` | 自定义回调基类，定义所有钩子 |
-| 回调常量定义 | `litellm/__init__.py` | 回调列表、已知兼容回调 |
+| _known_custom_logger_compatible_callbacks | `litellm/__init__.py:102-157` | 已知兼容回调列表，这些回调会被双通道触发 |
 | _client_async_logging_helper | `litellm/utils.py:1176` | 异步调用的日志包装，将异步回调入队到 LoggingWorker |
 | 常量定义 | `litellm/constants.py` | MAX_CALLBACKS, LOGGING_WORKER_* 等常量 |
-
-**⚠️ 重要修正**：核心日志类在 `litellm_logging.py`，不是 `logging.py`。
 
 ### 3. 常见使用模式
 
@@ -761,29 +1010,21 @@ response = litellm.completion(
 )
 ```
 
-#### 模式2: 多平台组合
+#### 模式2: 动态回调（单次调用）
 
 ```python
 import litellm
 
-# 同时使用 Prometheus + LangFuse + S3 冷存储
-# 注意：如果使用同步 completion()，建议注册到 success_callback
-# 如果使用异步 acompletion()，可以注册到 _async_success_callback
-litellm._async_success_callback = [
-    "prometheus",   # 指标监控
-    "langfuse",     # 详细追踪
-    "s3_v2"         # 日志归档
-]
+# 全局配置
+litellm.success_callback = ["prometheus"]  # 所有调用都记录到 Prometheus
 
-# 配置 S3
-os.environ["AWS_ACCESS_KEY_ID"] = "xxx"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "xxx"
-os.environ["S3_BUCKET_NAME"] = "my-litellm-logs"
-
-# 推荐使用异步调用
+# 特定调用额外记录到 LangFuse
+# ⚠️ langfuse 是 known_custom_logger_compatible_callbacks
+# 如果使用 acompletion，会在同步和异步两条通道都执行
 response = await litellm.acompletion(
     model="gpt-3.5-turbo",
-    messages=[{"role": "user", "content": "Hello"}]
+    messages=[{"role": "user", "content": "重要请求"}],
+    success_callback=["langfuse"]  # 仅本次调用
 )
 ```
 
@@ -794,28 +1035,29 @@ from litellm.integrations.custom_logger import CustomLogger
 import litellm
 
 class MyCustomLogger(CustomLogger):
-    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        # 访问标准化日志对象
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        # 同步通道会调用这个方法
         payload = kwargs.get("standard_logging_object")
-        model = payload.get("model")
-        cost = payload.get("response_cost")
-        tokens = payload.get("total_tokens")
-        
-        # 发送到内部系统
-        await self.send_to_internal_api({
-            "model": model,
-            "cost": cost,
-            "tokens": tokens,
-            "timestamp": end_time.isoformat()
-        })
+        print(f"[SYNC] Model: {payload.get('model')}")
     
-    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        # 处理失败情况
-        error = kwargs.get("standard_logging_object", {}).get("error_str")
-        await self.alert_on_error(error)
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        # 异步通道会调用这个方法
+        # ⚠️ 注意：如果作为动态回调，这个方法不会自动被调用！
+        # 因为自定义实例不是 known_custom_logger_compatible_callbacks
+        payload = kwargs.get("standard_logging_object")
+        print(f"[ASYNC] Cost: {payload.get('response_cost')}")
 
-# 注册
-litellm.callbacks = [MyCustomLogger()]
+# 注册为全局回调
+my_logger = MyCustomLogger()
+litellm.success_callback = [my_logger]  # 同步通道
+litellm._async_success_callback = [my_logger]  # 异步通道
+
+# 或者作为动态回调（只触发同步通道的 log_success_event）
+response = litellm.completion(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello"}],
+    success_callback=[my_logger]  # 只触发 log_success_event()
+)
 ```
 
 #### 模式4: 仅在 Proxy 中配置
@@ -838,43 +1080,88 @@ general_settings:
         DD-API-KEY: "os.environ/DD_API_KEY"
 ```
 
-### 4. 性能优化建议
+### 4. 性能优化与最佳实践
 
-1. **优先使用异步调用** (`acompletion`)
-   - 异步调用确保同步回调和异步回调都能正确执行
-   - 异步回调通过 `LoggingWorker` 后台执行，不阻塞主路径
-   - 同步回调 (`success_callback`) 会阻塞响应返回
+#### 4.1 回调配置建议
 
-2. **控制回调数量**
-   - 默认最大 100 个回调限制
-   - 可通过 `LITELLM_MAX_CALLBACKS` 环境变量覆盖
-   - 太多回调会增加日志处理延迟
+| 场景 | 推荐配置 | 原因 |
+|------|---------|------|
+| 使用 `completion()` 同步调用 | 注册到 `success_callback` | 异步通道不会触发 |
+| 使用 `acompletion()` 异步调用 | 可以注册到任一通道 | 两条通道都会触发 |
+| 动态回调（单次调用） | 使用已知兼容回调字符串 | 会自动双通道触发 |
+| 自定义 CustomLogger | 显式注册到两条通道 | 不会自动双通道触发 |
 
-3. **理解同步 vs 异步回调行为差异**
-   | 场景 | 同步回调 (success_callback) | 异步回调 (_async_success_callback) |
-   |------|-----------------------------|-----------------------------------|
-   | `acompletion()` | 同步执行 | 通过 LoggingWorker 异步执行 |
-   | `completion()` | 同步执行 | **不执行** (除 openmeter 特殊处理) |
-   | 阻塞主路径 | 是 | 否 |
+#### 4.2 注意事项
 
-4. **特殊回调注意事项**
-   - `openmeter`: 在同步调用中会被特殊处理（同步执行）
-   - `dynamodb`: 自动路由到异步列表，但同步调用中**不会**被执行
+1. **回调执行顺序不固定**
+   - `get_combined_callback_list` 使用 `set()` 去重
+   - 不要依赖回调的执行顺序
 
-5. **流式响应注意**
-   - 流式响应会在流结束后才触发完整日志
-   - 如果需要实时日志，考虑使用 `log_stream_event` 钩子
+2. **动态回调的双通道触发**
+   - 只有 `known_custom_logger_compatible_callbacks` 中的字符串回调会自动双通道触发
+   - 自定义 `CustomLogger` 实例或普通函数不会自动添加到异步通道
 
-6. **监控日志工作器**
-   - 关注 `LoggingWorker queue is full` 警告
-   - 这表示日志处理速度跟不上生产速度
-   - 可通过 `LOGGING_WORKER_CONCURRENCY` 调大并发数（默认 100）
-   - 或通过 `LOGGING_WORKER_MAX_QUEUE_SIZE` 调大队列大小（默认 50,000）
+3. **同步 vs 异步调用**
+   - `completion()` 同步调用不会触发异步通道（除 `openmeter` 特殊处理）
+   - `acompletion()` 异步调用会触发两条通道
+
+4. **去重机制**
+   - 如果同一个回调同时出现在动态回调和全局回调中，`set()` 会自动去重
+   - 只会执行一次
+
+#### 4.3 常见陷阱
+
+**陷阱1: 自定义回调作为动态回调时异步方法不执行**
+
+```python
+# ❌ 问题：自定义回调的 async_log_success_event 不会被调用
+class MyLogger(CustomLogger):
+    async def async_log_success_event(self, ...):
+        # 这个方法不会被调用！
+        pass
+
+response = await litellm.acompletion(
+    model="gpt-3.5",
+    messages=[...],
+    success_callback=[MyLogger()]  # 动态回调
+)
+
+# ✅ 解决方案：显式注册到异步通道，或使用同步方法
+class MyLogger(CustomLogger):
+    def log_success_event(self, ...):
+        # 这个方法会被调用
+        pass
+```
+
+**陷阱2: 依赖回调执行顺序**
+
+```python
+# ❌ 问题：假设回调按注册顺序执行
+litellm.success_callback = ["callback_a", "callback_b"]
+
+# ✅ 实际：顺序不固定，使用 set() 去重
+# 如果需要固定顺序，不要依赖合并机制
+```
+
+**陷阱3: 同步调用时代码期望异步回调执行**
+
+```python
+# ❌ 问题：同步调用时异步通道不会触发
+litellm._async_success_callback = ["langfuse"]
+
+# 同步调用 - langfuse 不会被执行！
+response = litellm.completion(model="gpt-3.5", messages=[...])
+
+# ✅ 解决方案：
+# 方案1: 使用 acompletion
+# 方案2: 注册到 success_callback
+litellm.success_callback = ["langfuse"]
+```
 
 ### 5. 错误修正汇总
 
-| 修正项 | 错误描述 | 正确值 |
-|--------|---------|--------|
+| 修正项 | 之前错误描述 | 正确值 |
+|--------|-------------|--------|
 | MAX_CALLBACKS | 30 | **100** (可通过 `LITELLM_MAX_CALLBACKS` 覆盖) |
 | LOGGING_WORKER_CONCURRENCY | 10 | **100** |
 | LOGGING_WORKER_MAX_QUEUE_SIZE | 1000 | **50,000** |
@@ -882,6 +1169,8 @@ general_settings:
 | LOGGING_WORKER_AGGRESSIVE_CLEAR_COOLDOWN_SECONDS | 1 秒 | **0.5 秒** |
 | 核心日志文件路径 | `logging.py` | **`litellm_logging.py`** |
 | 同步调用时异步回调 | 暗示会触发 | **不会触发** (除 `openmeter` 特殊处理) |
+| 回调执行顺序 | 固定优先级 | **顺序不保证** (使用 `set()` 去重) |
+| 动态回调 | 只在单通道触发 | **已知兼容回调会双通道触发** |
 
 ---
 
@@ -891,12 +1180,12 @@ general_settings:
 
 ### 1. 生命周期钩子
 
-| 方法名 | 调用时机 | 主要用途 |
-|--------|---------|---------|
-| `log_pre_api_call` / `async_log_pre_api_call` | API 调用之前 | 记录请求即将发出、准备追踪 |
-| `log_success_event` / `async_log_success_event` | 调用成功后 | 记录成功调用、计算成本 |
-| `log_failure_event` / `async_log_failure_event` | 调用失败后 | 记录错误、异常追踪 |
-| `log_stream_event` / `async_log_stream_event` | 流式每个 chunk | 实时流式日志 |
+| 方法名 | 调用时机 | 主要用途 | 执行通道 |
+|--------|---------|---------|---------|
+| `log_pre_api_call` / `async_log_pre_api_call` | API 调用之前 | 记录请求即将发出、准备追踪 | 同步 / 异步 |
+| `log_success_event` / `async_log_success_event` | 调用成功后 | 记录成功调用、计算成本 | 同步 / 异步 |
+| `log_failure_event` / `async_log_failure_event` | 调用失败后 | 记录错误、异常追踪 | 同步 / 异步 |
+| `log_stream_event` / `async_log_stream_event` | 流式每个 chunk | 实时流式日志 | 同步 / 异步 |
 
 ### 2. 数据修改钩子
 
@@ -941,4 +1230,4 @@ general_settings:
 ---
 
 *文档生成时间: 2026-05-02*
-*基于 LiteLLM 代码库分析，修正版本*
+*基于 LiteLLM 代码库分析，修正版本 v2*
